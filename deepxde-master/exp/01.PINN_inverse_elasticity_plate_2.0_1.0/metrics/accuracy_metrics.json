@@ -1,0 +1,37 @@
+{
+    "ux": {
+        "L2_rel_error": 0.005448848474770784,
+        "max_rel_error": 5854986.5,
+        "mean_rel_error": 22985.744140625,
+        "mean_abs_error": 0.0018397278618067503,
+        "max_abs_error": 0.012895194813609123
+    },
+    "uy": {
+        "L2_rel_error": 0.00819717813283205,
+        "max_rel_error": 24075212.0,
+        "mean_rel_error": 155330.0625,
+        "mean_abs_error": 0.0017148340120911598,
+        "max_abs_error": 0.007840126752853394
+    },
+    "Sxx": {
+        "L2_rel_error": 0.006452811881899834,
+        "max_rel_error": 1194951.625,
+        "mean_rel_error": 1268.161376953125,
+        "mean_abs_error": 0.01619281806051731,
+        "max_abs_error": 0.1825869083404541
+    },
+    "Syy": {
+        "L2_rel_error": 0.008435551077127457,
+        "max_rel_error": 23333672.0,
+        "mean_rel_error": 23781.86328125,
+        "mean_abs_error": 0.020019765943288803,
+        "max_abs_error": 0.1572878211736679
+    },
+    "Sxy": {
+        "L2_rel_error": 0.023527929559350014,
+        "max_rel_error": 239807.390625,
+        "mean_rel_error": 114.5704345703125,
+        "mean_abs_error": 0.015559946186840534,
+        "max_abs_error": 0.21847423911094666
+    }
+}

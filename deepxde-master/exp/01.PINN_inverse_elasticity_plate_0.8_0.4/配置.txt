@@ -1,0 +1,39 @@
+    λ 0.8 μ0.4
+    
+    # 学习率
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    
+    # 训练迭代次数
+    parser.add_argument("--iterations", type=int, default=50000, help="Number of training iterations")
+    
+    # 显示和记录频率
+    parser.add_argument("--display_every", type=int, default=1000, help="Display and recording frequency")
+    
+    # 域内配点数量（用于计算PDE残差）
+    parser.add_argument("--num_domain", type=int, default=2000, help="Number of domain collocation points")
+    
+    # 边界配点数量
+    parser.add_argument("--num_boundary", type=int, default=2000, help="Number of boundary points")
+    
+    # 测试点数量（用于评估模型精度）
+    parser.add_argument("--num_test", type=int, default=5000, help="Number of test points")
+    
+    # 观测点数量（用于反演的训练数据）
+    parser.add_argument("--num_observe", type=int, default=500, help="Number of observation points for inverse problem")
+    
+    # 结果保存目录
+    parser.add_argument(
+        "--save_dir",
+        type=str,
+        default="/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/deepxde-master/exp/01.PINN_inverse_elasticity_plate",
+        help="Directory to save results"
+    )
+    
+    # 运行模式：训练(train)或测试(test)
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
+                        help='Running mode: train or test')
+    
+    # 模型加载路径（仅测试模式使用），若不指定则尝试加载默认路径
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to load model (for test mode). If not specified, tries to load from default save directory.')
+         

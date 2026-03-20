@@ -1,0 +1,23 @@
+{
+    "delta": null,
+    "num_points": 10043,
+    "field_names": [
+        "ux",
+        "uy",
+        "Sxx",
+        "Syy",
+        "Sxy"
+    ],
+    "X_shape": [
+        10043,
+        2
+    ],
+    "y_pred_shape": [
+        10043,
+        5
+    ],
+    "y_true_shape": [
+        10043,
+        5
+    ]
+}

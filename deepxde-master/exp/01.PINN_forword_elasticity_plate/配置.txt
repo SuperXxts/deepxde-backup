@@ -1,0 +1,44 @@
+    # 运行模式：训练(train)或测试(test)
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'],
+                        help='Running mode: train or test')
+    
+    # 模型加载路径（仅测试模式使用），若不指定则尝试加载默认路径
+    parser.add_argument('--model_path', type=str, default=None,
+                        help='Path to load model (for test mode). If not specified, tries to load from default save directory.')
+    
+    # 是否禁用可视化绘图
+    parser.add_argument('--no_plot', action='store_true',
+                        help='Disable plotting visualization')
+    
+    # 是否仅计算评估指标（不进行可视化，等同于--no_plot）
+    parser.add_argument('--metrics_only', action='store_true',
+                        help='Only calculate metrics, no visualization (equivalent to --no_plot)')
+
+    
+    # 训练迭代次数
+    parser.add_argument('--iterations', type=int, default=50000,
+                        help='Number of training iterations')
+
+    # 显示和评估频率
+    parser.add_argument('--display_every', type=int, default=1000,
+                        help='Display and evaluation frequency')
+
+    # 域内采样点数量
+    parser.add_argument('--num_domain', type=int, default=2000,
+                        help='Number of domain points')
+
+    # 边界采样点数量
+    parser.add_argument('--num_boundary', type=int, default=2000,
+                        help='Number of boundary points')
+
+    # 测试点数量
+    parser.add_argument('--num_test', type=int, default=5000,
+                        help='Number of test points')
+
+    # 学习率
+    parser.add_argument('--lr', type=float, default=0.001,
+                        help='Learning rate')
+    
+    # 结果保存目录，若不指定则使用默认路径
+    parser.add_argument('--save_dir', type=str, default="/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/deepxde-master/exp/01.PINN_forword_elasticity_plate",
+                        help='Directory to save results. If None, uses default path.')

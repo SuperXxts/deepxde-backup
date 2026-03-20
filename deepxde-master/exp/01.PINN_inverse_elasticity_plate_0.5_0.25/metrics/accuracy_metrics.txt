@@ -1,0 +1,35 @@
+ux
+  L2_rel_error: 9.821598e-03
+  max_rel_error: 8.048570e+06
+  mean_rel_error: 2.760992e+04
+  mean_abs_error: 3.849359e-03
+  max_abs_error: 1.946020e-02
+
+uy
+  L2_rel_error: 2.025273e-02
+  max_rel_error: 6.402028e+07
+  mean_rel_error: 4.220420e+05
+  mean_abs_error: 4.034630e-03
+  max_abs_error: 1.802170e-02
+
+Sxx
+  L2_rel_error: 1.457208e-02
+  max_rel_error: 3.542234e+06
+  mean_rel_error: 3.049959e+03
+  mean_abs_error: 4.768924e-02
+  max_abs_error: 2.475979e-01
+
+Syy
+  L2_rel_error: 3.307931e-02
+  max_rel_error: 4.542142e+07
+  mean_rel_error: 4.879579e+04
+  mean_abs_error: 8.692509e-02
+  max_abs_error: 3.061771e-01
+
+Sxy
+  L2_rel_error: 7.298130e-02
+  max_rel_error: 3.506956e+05
+  mean_rel_error: 1.442208e+02
+  mean_abs_error: 5.606426e-02
+  max_abs_error: 3.856127e-01
+

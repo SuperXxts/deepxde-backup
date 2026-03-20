@@ -1,0 +1,35 @@
+ux
+  L2_rel_error: 6.620216e-03
+  max_rel_error: 7.519106e+06
+  mean_rel_error: 2.149622e+04
+  mean_abs_error: 2.201304e-03
+  max_abs_error: 1.325851e-02
+
+uy
+  L2_rel_error: 6.545561e-03
+  max_rel_error: 3.913310e+07
+  mean_rel_error: 3.393301e+05
+  mean_abs_error: 1.466192e-03
+  max_abs_error: 6.236795e-03
+
+Sxx
+  L2_rel_error: 7.654033e-03
+  max_rel_error: 5.484464e+06
+  mean_rel_error: 5.392496e+03
+  mean_abs_error: 2.105866e-02
+  max_abs_error: 1.755871e-01
+
+Syy
+  L2_rel_error: 6.697002e-03
+  max_rel_error: 1.851549e+07
+  mean_rel_error: 2.811058e+04
+  mean_abs_error: 1.481081e-02
+  max_abs_error: 1.357900e-01
+
+Sxy
+  L2_rel_error: 2.294261e-02
+  max_rel_error: 2.779746e+06
+  mean_rel_error: 1.007641e+03
+  mean_abs_error: 1.512389e-02
+  max_abs_error: 1.534399e-01
+
