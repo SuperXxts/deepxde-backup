@@ -1149,10 +1149,13 @@ class Model:
         elif backend_name == "tensorflow":
             self.net.load_weights(save_path)
         elif backend_name == "pytorch":
+            load_kwargs = {}
             if device is not None:
-                checkpoint = torch.load(save_path, map_location=torch.device(device), weights_only=True)
-            else:
-                checkpoint = torch.load(save_path, weights_only=True)
+                load_kwargs["map_location"] = torch.device(device)
+            try:
+                checkpoint = torch.load(save_path, weights_only=True, **load_kwargs)
+            except TypeError:
+                checkpoint = torch.load(save_path, **load_kwargs)
             self.net.load_state_dict(checkpoint["model_state_dict"])
             self.opt.load_state_dict(checkpoint["optimizer_state_dict"])
         elif backend_name == "paddle":

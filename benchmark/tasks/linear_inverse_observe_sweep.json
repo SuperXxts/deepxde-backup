@@ -1,0 +1,18 @@
+{
+  "name": "linear_inverse_observe_sweep",
+  "type": "sweep",
+  "script": "deepxde-master/my_example/pinn_inverse/01.inverse_PINN_elasticity_plate.py",
+  "args": {
+    "mode": "train",
+    "iterations": 50000,
+    "display_every": 1000,
+    "num_domain": 2000,
+    "num_boundary": 2000,
+    "num_test": 5000,
+    "lr": 0.001
+  },
+  "sweep": {
+    "arg": "num_observe",
+    "values": [100, 250, 500, 1000, 2000]
+  }
+}

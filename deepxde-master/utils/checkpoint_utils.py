@@ -72,8 +72,16 @@ class BestModelCheckpoint(dde.callbacks.Callback):
             # 准备数据
             # 注意：train_state.loss_train 是一个列表，包含各个loss分量
             loss_train = [float(x) for x in self.model.train_state.loss_train]
-            loss_test = [float(x) for x in self.model.train_state.loss_test] if self.model.train_state.loss_test else []
-            metrics = [float(x) for x in self.model.train_state.metrics_test] if self.model.train_state.metrics_test else []
+            has_loss_test = (
+                self.model.train_state.loss_test is not None
+                and len(self.model.train_state.loss_test) > 0
+            )
+            has_metrics = (
+                self.model.train_state.metrics_test is not None
+                and len(self.model.train_state.metrics_test) > 0
+            )
+            loss_test = [float(x) for x in self.model.train_state.loss_test] if has_loss_test else []
+            metrics = [float(x) for x in self.model.train_state.metrics_test] if has_metrics else []
             
             info = {
                 "step": int(self.model.train_state.iteration),

@@ -1,3 +1,8 @@
 deepxde-master.zip
 __pycache__/
 *.pyc
+benchmark/runs/
+benchmark/summary/
+benchmark/__pycache__/
+deepxde-master/exp/
+benchmark/images/

@@ -2,11 +2,17 @@ __all__ = ["get", "is_external_optimizer"]
 
 import torch
 
-from .nncg import NNCG
 from ..config import LBFGS_options, NNCG_options
+
+try:
+    from .nncg import NNCG
+except Exception:
+    NNCG = None
 
 
 def is_external_optimizer(optimizer):
+    if optimizer == "NNCG" and NNCG is None:
+        return False
     return optimizer in ["L-BFGS", "L-BFGS-B", "NNCG"]
 
 
@@ -31,6 +37,10 @@ def get(params, optimizer, learning_rate=None, decay=None, weight_decay=0):
             line_search_fn=("strong_wolfe" if LBFGS_options["maxls"] > 0 else None),
         )
     elif optimizer == "NNCG":
+        if NNCG is None:
+            raise ImportError(
+                "NNCG requires a newer PyTorch build with torch.func support."
+            )
         if weight_decay > 0:
             raise ValueError("NNCG optimizer doesn't support weight_decay > 0")
         if learning_rate is not None or decay is not None:

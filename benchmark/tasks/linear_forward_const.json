@@ -1,0 +1,14 @@
+{
+  "name": "linear_forward_const",
+  "type": "single_run",
+  "script": "deepxde-master/my_example/pinn_forward/01.forword_PINN_elasticity_plate.py",
+  "args": {
+    "mode": "train",
+    "iterations": 50000,
+    "display_every": 1000,
+    "num_domain": 2000,
+    "num_boundary": 2000,
+    "num_test": 5000,
+    "lr": 0.001
+  }
+}
