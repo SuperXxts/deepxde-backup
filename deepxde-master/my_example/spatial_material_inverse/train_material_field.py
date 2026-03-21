@@ -56,10 +56,13 @@ def main():
         "case": args.case,
         "iterations": args.iterations,
         "seed": args.seed,
+        "num_boundary": args.num_boundary,
         "num_observe": args.num_observe,
         "num_val_observe": args.num_val_observe,
         "num_eval_observe": args.num_eval_observe,
         "noise_level": args.noise_level,
+        "boundary_weight": args.boundary_weight,
+        "observation_split_tag": args.observation_split_tag,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
         "selection_metric": "validation_observation_mse",
     }
@@ -67,7 +70,9 @@ def main():
     if args.run_eval_after_train:
         summary["last_model_path"] = find_model_path(args.save_dir, prefer="last_model")
         summary["best_model_path"] = find_model_path(args.save_dir, prefer="best_model")
+        summary["observation_cache_path"] = metadata.get("observation_cache_path")
         summary["observation_split_sizes"] = {
+            "boundary": int(len(metadata["boundary_observation"]["points"])),
             "train": int(len(metadata["train_observation"]["points"])),
             "validation": int(len(metadata["val_observation"]["points"])),
             "evaluation": int(len(metadata["eval_observation"]["points"])),

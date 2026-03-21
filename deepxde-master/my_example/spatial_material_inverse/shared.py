@@ -48,6 +48,7 @@ FIELD_NAMES = ["ux", "uy", "sxx", "syy", "sxy", "lambda", "mu"]
 STATE_FIELD_NAMES = FIELD_NAMES[:5]
 MATERIAL_FIELD_NAMES = FIELD_NAMES[5:]
 DEFAULT_EXP_ROOT = os.path.join(ROOT_DIR, "exp", "spatial_material_inverse")
+DEFAULT_OBSERVATION_CACHE_DIR = os.path.join(DEFAULT_EXP_ROOT, "_shared_observation_splits")
 
 
 @dataclass
@@ -279,18 +280,69 @@ def build_observation_points(num_observe, seed):
     return rng.random((num_observe, 2))
 
 
-def build_observation_splits(num_train, num_val, num_eval, seed):
+def resolve_observation_split_cache_path(cache_dir, case_name, seed, num_train, num_val, num_eval, tag):
+    filename = (
+        f"{case_name}_seed{seed}_train{int(num_train)}_val{int(num_val)}_eval{int(num_eval)}_{tag}.npz"
+    )
+    return os.path.join(cache_dir, filename)
+
+
+def build_observation_splits(num_train, num_val, num_eval, seed, case_name, cache_dir=None, tag="official_softbc_v1"):
     total = int(num_train) + int(num_val) + int(num_eval)
     if total <= 0:
         raise ValueError("At least one observation point is required.")
+
+    cache_path = None
+    if cache_dir:
+        ensure_dir(cache_dir)
+        cache_path = resolve_observation_split_cache_path(
+            cache_dir=cache_dir,
+            case_name=case_name,
+            seed=seed,
+            num_train=num_train,
+            num_val=num_val,
+            num_eval=num_eval,
+            tag=tag,
+        )
+        if os.path.exists(cache_path):
+            cached = np.load(cache_path)
+            return {
+                "train": np.asarray(cached["train"], dtype=float),
+                "val": np.asarray(cached["val"], dtype=float),
+                "eval": np.asarray(cached["eval"], dtype=float),
+                "cache_path": cache_path,
+            }
+
     points = build_observation_points(total, seed)
     train_end = int(num_train)
     val_end = train_end + int(num_val)
-    return {
-        "train": points[:train_end],
-        "val": points[train_end:val_end],
-        "eval": points[val_end:],
+    splits = {
+        "train": np.asarray(points[:train_end], dtype=float),
+        "val": np.asarray(points[train_end:val_end], dtype=float),
+        "eval": np.asarray(points[val_end:], dtype=float),
+        "cache_path": cache_path,
     }
+    if cache_path is not None:
+        np.savez(cache_path, train=splits["train"], val=splits["val"], eval=splits["eval"])
+    return splits
+
+
+def build_boundary_points(num_boundary):
+    num_boundary = int(num_boundary)
+    if num_boundary <= 0:
+        return np.zeros((0, 2), dtype=float)
+    perimeter = np.linspace(0.0, 4.0, num_boundary, endpoint=False, dtype=float)
+    points = np.zeros((num_boundary, 2), dtype=float)
+    for idx, value in enumerate(perimeter):
+        if value < 1.0:
+            points[idx] = [value, 0.0]
+        elif value < 2.0:
+            points[idx] = [1.0, value - 1.0]
+        elif value < 3.0:
+            points[idx] = [3.0 - value, 1.0]
+        else:
+            points[idx] = [0.0, 4.0 - value]
+    return points
 
 
 def add_noise(values, noise_level, seed):
@@ -443,28 +495,14 @@ class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
         lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
         mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
 
-        gate = (
-            inputs[:, 0:1]
-            * (1.0 - inputs[:, 0:1])
-            * inputs[:, 1:2]
-            * (1.0 - inputs[:, 1:2])
-        )
-        ux = gate * state_outputs[:, 0:1]
-        uy = gate * state_outputs[:, 1:2]
-        outputs = torch.cat((ux, uy, state_outputs[:, 2:5], lmbd, mu), dim=1)
+        outputs = torch.cat((state_outputs[:, 0:2], state_outputs[:, 2:5], lmbd, mu), dim=1)
         return outputs
 
 
 def make_output_transform(lambda_floor, mu_floor, method=None):
     def output_transform(inputs, outputs):
-        gate = (
-            inputs[:, 0:1]
-            * (1.0 - inputs[:, 0:1])
-            * inputs[:, 1:2]
-            * (1.0 - inputs[:, 1:2])
-        )
-        ux = gate * outputs[:, 0:1]
-        uy = gate * outputs[:, 1:2]
+        ux = outputs[:, 0:1]
+        uy = outputs[:, 1:2]
         sxx = outputs[:, 2:3]
         syy = outputs[:, 3:4]
         sxy = outputs[:, 4:5]
@@ -590,6 +628,9 @@ def build_data(args, case_config):
         num_val=args.num_val_observe,
         num_eval=args.num_eval_observe,
         seed=args.seed + 17,
+        case_name=args.case,
+        cache_dir=args.observation_cache_dir,
+        tag=args.observation_split_tag,
     )
     train_observation = build_observation_payload(
         observation_splits["train"], case_config, args.noise_level, args.seed + 123
@@ -600,22 +641,28 @@ def build_data(args, case_config):
     eval_observation = build_observation_payload(
         observation_splits["eval"], case_config, args.noise_level, args.seed + 323
     )
+    boundary_points = build_boundary_points(args.num_boundary)
+    boundary_observation = build_observation_payload(boundary_points, case_config, 0.0, args.seed + 423)
 
+    boundary_ux = dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 0:1], component=0)
+    boundary_uy = dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 1:2], component=1)
     observe_ux = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 0:1], component=0)
     observe_uy = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 1:2], component=1)
     data = dde.data.PDE(
         geom,
         build_pde(case_config, args.reg_weight, args.method),
-        [observe_ux, observe_uy],
+        [boundary_ux, boundary_uy, observe_ux, observe_uy],
         num_domain=args.num_domain,
         num_boundary=0,
         num_test=args.num_test,
         train_distribution="pseudo",
     )
     metadata = {
+        "boundary_observation": boundary_observation,
         "train_observation": train_observation,
         "val_observation": val_observation,
         "eval_observation": eval_observation,
+        "observation_cache_path": observation_splits.get("cache_path"),
     }
     return geom, data, metadata
 
@@ -625,7 +672,7 @@ def resolve_run_name(args):
         return args.run_name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return (
-        f"{args.case}_obs{args.num_observe}_val{args.num_val_observe}_eval{args.num_eval_observe}_noise{args.noise_level:.3f}_"
+        f"{args.case}_bc{args.num_boundary}_obs{args.num_observe}_val{args.num_val_observe}_eval{args.num_eval_observe}_noise{args.noise_level:.3f}_"
         f"seed{args.seed}_iter{args.iterations}_{timestamp}"
     )
 
@@ -656,6 +703,7 @@ def save_case_and_sampling_figure(
     save_dir,
     case_config,
     domain_points,
+    boundary_points,
     train_observation_points,
     val_observation_points,
     eval_observation_points,
@@ -681,6 +729,16 @@ def save_case_and_sampling_figure(
         fig.colorbar(image, ax=axis)
 
     axes[2].scatter(domain_points[:, 0], domain_points[:, 1], s=8, alpha=0.25, label="Domain points")
+    if len(boundary_points) > 0:
+        axes[2].scatter(
+            boundary_points[:, 0],
+            boundary_points[:, 1],
+            s=22,
+            alpha=0.9,
+            color="#111827",
+            marker="x",
+            label="Boundary points",
+        )
     if len(train_observation_points) > 0:
         axes[2].scatter(
             train_observation_points[:, 0],
@@ -736,12 +794,16 @@ def save_training_artifacts(
         "parameter_count": count_trainable_parameters(net),
         "field_names": FIELD_NAMES,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
-        "bc_loss_names": ["obs_ux", "obs_uy"],
+        "bc_loss_names": ["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
         "selection_metric": "validation_observation_mse",
+        "observation_cache_path": metadata.get("observation_cache_path"),
     }
     save_json(_get_save_path(save_dir, "json", "run_config.json"), config_payload)
     np.savez(
         _get_save_path(save_dir, "npz", "observation_data.npz"),
+        boundary_points=metadata["boundary_observation"]["points"],
+        boundary_observation_clean=metadata["boundary_observation"]["clean"],
+        boundary_observation_true_state=metadata["boundary_observation"]["true_state"],
         train_observation_points=metadata["train_observation"]["points"],
         train_observation_clean=metadata["train_observation"]["clean"],
         train_observation_noisy=metadata["train_observation"]["noisy"],
@@ -763,6 +825,7 @@ def save_training_artifacts(
             save_dir=save_dir,
             case_config=case_config,
             domain_points=domain_points,
+            boundary_points=metadata["boundary_observation"]["points"],
             train_observation_points=metadata["train_observation"]["points"],
             val_observation_points=metadata["val_observation"]["points"],
             eval_observation_points=metadata["eval_observation"]["points"],
@@ -775,10 +838,10 @@ def save_training_artifacts(
             save_dir,
             filename="loss_history.png",
             num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
-            num_bc_losses=2,
+            num_bc_losses=4,
             pde_label="Physics Loss",
-            bc_label="Observation Loss",
-            bc_loss_names=["obs_ux", "obs_uy"],
+            bc_label="Boundary + Observation Loss",
+            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
             data_loss_prefix="obs_",
         )
         plot_all_loss_components(
@@ -786,9 +849,9 @@ def save_training_artifacts(
             save_dir,
             filename="loss_components.png",
             num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
-            num_bc_losses=2,
+            num_bc_losses=4,
             pde_loss_names=pde_loss_names(args.reg_weight, args.method),
-            bc_loss_names=["obs_ux", "obs_uy"],
+            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
         )
         save_loss_history_json(losshistory, save_dir, filename="loss_history.json")
         save_best_test_loss_json(losshistory, save_dir, filename="best_test_loss.json")
@@ -1094,7 +1157,7 @@ def evaluate_model(
 def build_model(args, data):
     net = build_network(args)
     model = dde.Model(data, net)
-    loss_weights = pde_loss_weights(args.reg_weight, args.method) + [args.data_weight, args.data_weight]
+    loss_weights = pde_loss_weights(args.reg_weight, args.method) + [args.boundary_weight, args.boundary_weight, args.data_weight, args.data_weight]
     model.compile("adam", lr=args.lr, loss_weights=loss_weights)
     return model, net
 
@@ -1108,11 +1171,11 @@ def make_callbacks(args, save_dir, metadata):
             period=args.display_every,
             filename="loss_history.png",
             num_pde_losses=num_pde,
-            num_bc_losses=2,
+            num_bc_losses=4,
             pde_loss_names=pde_loss_names(args.reg_weight, args.method),
-            bc_loss_names=["obs_ux", "obs_uy"],
+            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
             pde_label="Physics Loss",
-            bc_label="Observation Loss",
+            bc_label="Boundary + Observation Loss",
             save_all_components=True,
         ),
         ValidationObservationCheckpoint(
@@ -1152,16 +1215,18 @@ def build_common_parser(description):
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--iterations", type=int, default=30000)
+    parser.add_argument("--iterations", type=int, default=50000)
     parser.add_argument("--display_every", type=int, default=1000)
     parser.add_argument("--num_domain", type=int, default=4000)
     parser.add_argument("--num_test", type=int, default=2000)
+    parser.add_argument("--num_boundary", type=int, default=400)
     parser.add_argument("--num_observe", type=int, default=500)
-    parser.add_argument("--num_val_observe", type=int, default=100)
-    parser.add_argument("--num_eval_observe", type=int, default=250)
+    parser.add_argument("--num_val_observe", type=int, default=200)
+    parser.add_argument("--num_eval_observe", type=int, default=500)
     parser.add_argument("--noise_level", type=float, default=0.0)
     parser.add_argument("--reg_weight", type=float, default=1e-4)
     parser.add_argument("--data_weight", type=float, default=20.0)
+    parser.add_argument("--boundary_weight", type=float, default=20.0)
     parser.add_argument("--lambda_floor", type=float, default=0.1)
     parser.add_argument("--mu_floor", type=float, default=0.1)
     parser.add_argument("--activation", type=str, default="tanh")
@@ -1170,6 +1235,8 @@ def build_common_parser(description):
     parser.add_argument("--interface_layers", type=str, default="64,64,64")
     parser.add_argument("--interface_sharpness", type=float, default=10.0)
     parser.add_argument("--num_frequencies", type=int, default=4)
+    parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
+    parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
@@ -1185,6 +1252,8 @@ def prepare_run(args):
         raise ValueError("num_val_observe must be positive for fair model selection.")
     if args.num_eval_observe <= 0:
         raise ValueError("num_eval_observe must be positive for held-out evaluation.")
+    if args.num_boundary <= 0:
+        raise ValueError("num_boundary must be positive when using unified soft boundary constraints.")
     set_random_seed(args.seed)
     if args.device_debug:
         print_gpu_info()
