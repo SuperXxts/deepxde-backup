@@ -385,6 +385,76 @@ class VanillaMaterialFieldNet(dde.nn.pytorch.nn.NN):
         return outputs
 
 
+def num_regions_for_case(case_name):
+    if case_name in {"layered", "single_inclusion"}:
+        return 1
+    if case_name == "double_inclusion":
+        return 2
+    raise ValueError(f"Unsupported case: {case_name}")
+
+
+class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
+    def __init__(
+        self,
+        case_name,
+        state_hidden_layers,
+        interface_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        interface_sharpness=10.0,
+    ):
+        super().__init__()
+        self.features = FourierFeatureMap(num_frequencies)
+        self.num_regions = num_regions_for_case(case_name)
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.interface_sharpness = float(interface_sharpness)
+        feature_dim = self.features.output_dim
+        self.state_net = SimpleMLP(
+            input_dim=feature_dim,
+            hidden_layers=state_hidden_layers,
+            output_dim=5,
+            activation=activation,
+        )
+        self.interface_net = SimpleMLP(
+            input_dim=feature_dim,
+            hidden_layers=interface_hidden_layers,
+            output_dim=self.num_regions,
+            activation=activation,
+        )
+        self.raw_lambda_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
+        self.raw_mu_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        state_outputs = self.state_net(features)
+        region_logits = self.interface_sharpness * self.interface_net(features)
+        background_logit = torch.zeros((inputs.shape[0], 1), dtype=region_logits.dtype, device=region_logits.device)
+        class_logits = torch.cat((background_logit, region_logits), dim=1)
+        class_probs = torch.softmax(class_logits, dim=1)
+
+        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
+        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+        lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
+        mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+
+        gate = (
+            inputs[:, 0:1]
+            * (1.0 - inputs[:, 0:1])
+            * inputs[:, 1:2]
+            * (1.0 - inputs[:, 1:2])
+        )
+        ux = gate * state_outputs[:, 0:1]
+        uy = gate * state_outputs[:, 1:2]
+        outputs = torch.cat((ux, uy, state_outputs[:, 2:5], lmbd, mu), dim=1)
+        return outputs
+
+
 def make_output_transform(lambda_floor, mu_floor, method=None):
     def output_transform(inputs, outputs):
         gate = (
@@ -410,12 +480,24 @@ def count_trainable_parameters(net):
 
 
 def build_network(args):
-    net = VanillaMaterialFieldNet(
-        hidden_layers=parse_hidden_layers(args.hidden_layers),
-        activation=args.activation,
-        num_frequencies=args.num_frequencies,
-    )
-    net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method))
+    if args.method == "iaminn":
+        net = InterfaceAwareMaterialNet(
+            case_name=args.case,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            interface_hidden_layers=parse_hidden_layers(args.interface_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            interface_sharpness=args.interface_sharpness,
+        )
+    else:
+        net = VanillaMaterialFieldNet(
+            hidden_layers=parse_hidden_layers(args.hidden_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+        )
+        net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method))
     return net
 
 
@@ -1060,7 +1142,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn"],
+        choices=["pinn", "iaminn"],
         default="pinn",
     )
     parser.add_argument(
@@ -1084,6 +1166,9 @@ def build_common_parser(description):
     parser.add_argument("--mu_floor", type=float, default=0.1)
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
+    parser.add_argument("--state_layers", type=str, default="128,128,128,128")
+    parser.add_argument("--interface_layers", type=str, default="64,64,64")
+    parser.add_argument("--interface_sharpness", type=float, default=10.0)
     parser.add_argument("--num_frequencies", type=int, default=4)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
     parser.add_argument("--run_name", type=str, default=None)
