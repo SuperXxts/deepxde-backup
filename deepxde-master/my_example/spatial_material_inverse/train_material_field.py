@@ -59,6 +59,9 @@ def parse_args():
     parser.add_argument("--material_stage_usage_floor", type=float, default=0.05)
     parser.add_argument("--material_stage_usage_weight", type=float, default=20.0)
     parser.add_argument("--material_stage_binary_weight", type=float, default=0.05)
+    parser.add_argument("--material_stage_contrast_weight", type=float, default=0.0)
+    parser.add_argument("--material_stage_lambda_gap_target", type=float, default=0.0)
+    parser.add_argument("--material_stage_mu_gap_target", type=float, default=0.0)
     parser.add_argument("--geometry_prior_weight", type=float, default=0.0)
     parser.add_argument("--layer_y_prior_target", type=float, default=0.5)
     parser.add_argument("--layer_y_init", type=float, default=-1.0)
@@ -408,6 +411,17 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             + float(args.material_stage_binary_weight) * terms["binary_penalty"]
             + float(args.geometry_prior_weight) * terms["geometry_prior"]
         )
+        contrast_penalty = torch.zeros((), dtype=torch.float32, device=total_loss.device)
+        lambda_regions = terms["lambda_regions"]
+        mu_regions = terms["mu_regions"]
+        if lambda_regions.numel() >= 2:
+            lambda_gap = lambda_regions[1] - lambda_regions[0]
+            mu_gap = mu_regions[1] - mu_regions[0]
+            contrast_penalty = (
+                torch.relu(float(args.material_stage_lambda_gap_target) - lambda_gap) ** 2
+                + torch.relu(float(args.material_stage_mu_gap_target) - mu_gap) ** 2
+            )
+        total_loss = total_loss + float(args.material_stage_contrast_weight) * contrast_penalty
         total_loss.backward()
         optimizer.step()
 
@@ -419,6 +433,7 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             "usage_penalty": float(terms["usage_penalty"].detach().cpu().item()),
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
             "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
+            "contrast_penalty": float(contrast_penalty.detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -430,13 +445,14 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         if step == 1 or step % display_every == 0 or step == args.material_stage_iterations:
             history_rows.append(row)
             print(
-                "[material_stage] step={} total={:.4e} physics={:.4e} reg={:.4e} usage={:.4e} binary={:.4e} geom={:.4e} probs={}".format(
+                "[material_stage] step={} total={:.4e} physics={:.4e} reg={:.4e} usage={:.4e} binary={:.4e} contrast={:.4e} geom={:.4e} probs={}".format(
                     row["step"],
                     row["total_loss"],
                     row["physics_mse"],
                     row["reg_mse"],
                     row["usage_penalty"],
                     row["binary_penalty"],
+                    row["contrast_penalty"],
                     row["geometry_prior"],
                     [round(value, 5) for value in row["mean_class_probs"]],
                 )
@@ -458,6 +474,9 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         "usage_floor": float(args.material_stage_usage_floor),
         "usage_weight": float(args.material_stage_usage_weight),
         "binary_weight": float(args.material_stage_binary_weight),
+        "contrast_weight": float(args.material_stage_contrast_weight),
+        "lambda_gap_target": float(args.material_stage_lambda_gap_target),
+        "mu_gap_target": float(args.material_stage_mu_gap_target),
         "geometry_prior_weight": float(args.geometry_prior_weight),
         "freeze_state": state_frozen,
         "num_points": int(len(stage_points)),
@@ -536,6 +555,9 @@ def main():
                     "material_stage_usage_floor": args.material_stage_usage_floor,
                     "material_stage_usage_weight": args.material_stage_usage_weight,
                     "material_stage_binary_weight": args.material_stage_binary_weight,
+                    "material_stage_contrast_weight": args.material_stage_contrast_weight,
+                    "material_stage_lambda_gap_target": args.material_stage_lambda_gap_target,
+                    "material_stage_mu_gap_target": args.material_stage_mu_gap_target,
                     "geometry_prior_weight": args.geometry_prior_weight,
                     "layer_y_prior_target": args.layer_y_prior_target,
                     "layer_y_init": args.layer_y_init,
