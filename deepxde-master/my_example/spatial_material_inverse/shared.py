@@ -47,8 +47,8 @@ PI = math.pi
 FIELD_NAMES = ["ux", "uy", "sxx", "syy", "sxy", "lambda", "mu"]
 STATE_FIELD_NAMES = FIELD_NAMES[:5]
 MATERIAL_FIELD_NAMES = FIELD_NAMES[5:]
-DEFAULT_EXP_ROOT = os.path.join(ROOT_DIR, "exp", "spatial_material_inverse")
-DEFAULT_OBSERVATION_CACHE_DIR = os.path.join(DEFAULT_EXP_ROOT, "_shared_observation_splits")
+DEFAULT_EXP_ROOT = os.path.join(ROOT_DIR, "exp")
+DEFAULT_OBSERVATION_CACHE_DIR = os.path.join(DEFAULT_EXP_ROOT, "_shared_observation_splits", "spatial_material_inverse")
 
 
 @dataclass
@@ -445,7 +445,7 @@ def num_regions_for_case(case_name):
     raise ValueError(f"Unsupported case: {case_name}")
 
 
-class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
+class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
     def __init__(
         self,
         case_name,
@@ -460,6 +460,7 @@ class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
         self.num_regions = num_regions_for_case(case_name)
+        self.case_name = case_name
         self.lambda_floor = float(lambda_floor)
         self.mu_floor = float(mu_floor)
         self.interface_sharpness = float(interface_sharpness)
@@ -467,7 +468,7 @@ class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
         self.state_net = SimpleMLP(
             input_dim=feature_dim,
             hidden_layers=state_hidden_layers,
-            output_dim=5,
+            output_dim=2,
             activation=activation,
         )
         self.interface_net = SimpleMLP(
@@ -479,24 +480,47 @@ class InterfaceAwareMaterialNet(dde.nn.pytorch.nn.NN):
         self.raw_lambda_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
         self.raw_mu_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
 
+    def _material_from_features(self, features):
+        region_logits = self.interface_sharpness * self.interface_net(features)
+        if self.num_regions == 1:
+            region_probability = torch.sigmoid(region_logits)
+            class_probs = torch.cat((1.0 - region_probability, region_probability), dim=1)
+            interface_indicator = region_logits
+        else:
+            background_logit = torch.zeros((features.shape[0], 1), dtype=region_logits.dtype, device=region_logits.device)
+            class_logits = torch.cat((background_logit, region_logits), dim=1)
+            class_probs = torch.softmax(class_logits, dim=1)
+            interface_indicator = region_logits[:, :1]
+        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
+        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+        lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
+        mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+        return lmbd, mu, interface_indicator, class_probs
+
     def forward(self, inputs):
         x = inputs
         if self._input_transform is not None:
             x = self._input_transform(inputs)
         features = self.features(x)
         state_outputs = self.state_net(features)
-        region_logits = self.interface_sharpness * self.interface_net(features)
-        background_logit = torch.zeros((inputs.shape[0], 1), dtype=region_logits.dtype, device=region_logits.device)
-        class_logits = torch.cat((background_logit, region_logits), dim=1)
-        class_probs = torch.softmax(class_logits, dim=1)
-
-        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
-        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
-        lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
-        mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
-
-        outputs = torch.cat((state_outputs[:, 0:2], state_outputs[:, 2:5], lmbd, mu), dim=1)
+        lmbd, mu, _, _ = self._material_from_features(features)
+        outputs = torch.cat((state_outputs, lmbd, mu), dim=1)
         return outputs
+
+    def predict_material_diagnostics(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        lmbd, mu, interface_indicator, class_probs = self._material_from_features(features)
+        return {
+            "lambda": lmbd,
+            "mu": mu,
+            "interface_indicator": interface_indicator,
+            "class_probs": class_probs,
+            "lambda_regions": self.lambda_floor + F.softplus(self.raw_lambda_params),
+            "mu_regions": self.mu_floor + F.softplus(self.raw_mu_params),
+        }
 
 
 def make_output_transform(lambda_floor, mu_floor, method=None):
@@ -517,9 +541,13 @@ def count_trainable_parameters(net):
     return int(sum(parameter.numel() for parameter in net.parameters() if parameter.requires_grad))
 
 
+def is_compact_material_method(method):
+    return method == "iaminn_v2"
+
+
 def build_network(args):
-    if args.method == "iaminn":
-        net = InterfaceAwareMaterialNet(
+    if args.method == "iaminn_v2":
+        net = InterfaceAwareMaterialNetV2(
             case_name=args.case,
             state_hidden_layers=parse_hidden_layers(args.state_layers),
             interface_hidden_layers=parse_hidden_layers(args.interface_layers),
@@ -549,6 +577,35 @@ def build_pde(case_config, reg_weight, method=None):
         exx = ux_x
         eyy = uy_y
         exy = 0.5 * (ux_y + uy_x)
+        if is_compact_material_method(method):
+            lambda_idx, mu_idx = 2, 3
+            lmbd = y[:, lambda_idx:lambda_idx + 1]
+            mu = y[:, mu_idx:mu_idx + 1]
+            constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+            constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+            constitutive_sxy = 2.0 * mu * exy
+
+            sxx_x = dde.grad.jacobian(constitutive_sxx, x, i=0, j=0)
+            syy_y = dde.grad.jacobian(constitutive_syy, x, i=0, j=1)
+            sxy_x = dde.grad.jacobian(constitutive_sxy, x, i=0, j=0)
+            sxy_y = dde.grad.jacobian(constitutive_sxy, x, i=0, j=1)
+
+            fx, fy = exact_body_force_torch(x, case_config)
+            residuals = [
+                sxx_x + sxy_y + fx,
+                sxy_x + syy_y + fy,
+            ]
+            if reg_weight > 0.0:
+                residuals.extend(
+                    [
+                        dde.grad.jacobian(y, x, i=lambda_idx, j=0),
+                        dde.grad.jacobian(y, x, i=lambda_idx, j=1),
+                        dde.grad.jacobian(y, x, i=mu_idx, j=0),
+                        dde.grad.jacobian(y, x, i=mu_idx, j=1),
+                    ]
+                )
+            return residuals
+
         lambda_idx, mu_idx = 5, 6
         lmbd = y[:, lambda_idx:lambda_idx + 1]
         mu = y[:, mu_idx:mu_idx + 1]
@@ -589,14 +646,20 @@ def build_pde(case_config, reg_weight, method=None):
 
 
 def pde_loss_names(reg_weight, method=None):
-    names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
+    if is_compact_material_method(method):
+        names = ["momentum_x", "momentum_y"]
+    else:
+        names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
     if reg_weight > 0.0:
         names.extend(["lambda_x", "lambda_y", "mu_x", "mu_y"])
     return names
 
 
 def pde_loss_weights(reg_weight, method=None):
-    weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+    if is_compact_material_method(method):
+        weights = [1.0, 1.0]
+    else:
+        weights = [1.0, 1.0, 1.0, 1.0, 1.0]
     if reg_weight > 0.0:
         weights.extend([reg_weight, reg_weight, reg_weight, reg_weight])
     return weights
@@ -677,9 +740,18 @@ def resolve_run_name(args):
     )
 
 
+def default_experiment_group(method):
+    mapping = {
+        "pinn": "PINN-baseline",
+        "iaminn_v2": "IAMINN-v2",
+    }
+    return mapping.get(method, method.upper())
+
+
 def resolve_save_dir(args):
     run_name = resolve_run_name(args)
-    return os.path.join(args.exp_root, args.case, args.method, run_name)
+    group_name = args.experiment_group or default_experiment_group(args.method)
+    return os.path.join(args.exp_root, group_name, args.case, run_name)
 
 
 def save_json(path, payload):
@@ -698,6 +770,81 @@ def save_json(path, payload):
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(to_serializable(payload), handle, indent=2, ensure_ascii=False)
 
+
+def save_text(path, text):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+
+def save_json_as_text(path, payload):
+    save_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def save_array_txt(path, array, header):
+    ensure_dir(os.path.dirname(path))
+    np.savetxt(path, np.asarray(array), fmt="%.10e", header=header, comments="")
+
+
+def save_metrics_text(path, payload):
+    lines = []
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for inner_key, inner_value in value.items():
+                lines.append(f"  {inner_key}: {inner_value}")
+        else:
+            lines.append(f"{key}: {value}")
+    save_text(path, "\n".join(lines) + "\n")
+
+
+def save_observation_split_files(save_dir, split_name, payload):
+    array_payload = {
+        "points": payload["points"],
+        "clean": payload["clean"],
+        "noisy": payload["noisy"],
+        "true_state": payload["true_state"],
+    }
+    np.savez(_get_save_path(save_dir, "npz", f"{split_name}_set_data.npz"), **array_payload)
+    combined = np.concatenate(
+        [
+            payload["points"],
+            payload["clean"],
+            payload["noisy"],
+            payload["true_state"],
+        ],
+        axis=1,
+    )
+    header = "x y clean_ux clean_uy noisy_ux noisy_uy true_ux true_uy true_sxx true_syy true_sxy true_lambda true_mu"
+    save_array_txt(_get_save_path(save_dir, "txt", f"{split_name}_set_data.txt"), combined, header)
+    metadata = {
+        "split": split_name,
+        "num_points": int(len(payload["points"])),
+        "field_names": FIELD_NAMES,
+    }
+    save_json(_get_save_path(save_dir, "json", f"{split_name}_set_metadata.json"), metadata)
+
+
+def save_loss_history_dat(losshistory, save_dir):
+    if losshistory is None:
+        return
+    steps = np.asarray(getattr(losshistory, "steps", []), dtype=float)
+    if steps.size == 0:
+        return
+    loss_train = np.asarray(getattr(losshistory, "loss_train", []), dtype=float)
+    loss_test = np.asarray(getattr(losshistory, "loss_test", []), dtype=float)
+    width = max(loss_train.shape[1] if loss_train.ndim == 2 else 0, loss_test.shape[1] if loss_test.ndim == 2 else 0)
+    train_pad = np.full((steps.shape[0], width), np.nan, dtype=float)
+    test_pad = np.full((steps.shape[0], width), np.nan, dtype=float)
+    if loss_train.ndim == 2 and loss_train.shape[1] > 0:
+        train_pad[:, : loss_train.shape[1]] = loss_train
+    if loss_test.ndim == 2 and loss_test.shape[1] > 0:
+        test_pad[:, : loss_test.shape[1]] = loss_test
+    table = np.concatenate([steps[:, None], train_pad, test_pad], axis=1)
+    train_headers = [f"train_loss_{idx}" for idx in range(width)]
+    test_headers = [f"test_loss_{idx}" for idx in range(width)]
+    header = "step " + " ".join(train_headers + test_headers)
+    save_array_txt(_get_save_path(save_dir, "dat", "loss_history.dat"), table, header)
 
 def save_case_and_sampling_figure(
     save_dir,
@@ -799,6 +946,7 @@ def save_training_artifacts(
         "observation_cache_path": metadata.get("observation_cache_path"),
     }
     save_json(_get_save_path(save_dir, "json", "run_config.json"), config_payload)
+    save_json_as_text(os.path.join(save_dir, "配置.txt"), config_payload)
     np.savez(
         _get_save_path(save_dir, "npz", "observation_data.npz"),
         boundary_points=metadata["boundary_observation"]["points"],
@@ -817,10 +965,15 @@ def save_training_artifacts(
         eval_observation_noisy=metadata["eval_observation"]["noisy"],
         eval_observation_true_state=metadata["eval_observation"]["true_state"],
     )
+    save_observation_split_files(save_dir, "boundary", metadata["boundary_observation"])
+    save_observation_split_files(save_dir, "train", metadata["train_observation"])
+    save_observation_split_files(save_dir, "validation", metadata["val_observation"])
+    save_observation_split_files(save_dir, "evaluation", metadata["eval_observation"])
 
     domain_points = getattr(args, "_domain_points_for_plot", None)
     if domain_points is not None:
         np.savez(_get_save_path(save_dir, "npz", "domain_points.npz"), domain_points=domain_points)
+        save_array_txt(_get_save_path(save_dir, "txt", "domain_points.txt"), domain_points, "x y")
         save_case_and_sampling_figure(
             save_dir=save_dir,
             case_config=case_config,
@@ -855,6 +1008,19 @@ def save_training_artifacts(
         )
         save_loss_history_json(losshistory, save_dir, filename="loss_history.json")
         save_best_test_loss_json(losshistory, save_dir, filename="best_test_loss.json")
+        save_loss_history_dat(losshistory, save_dir)
+
+    if args.method == "iaminn_v2" and hasattr(net, "predict_material_diagnostics"):
+        with torch.no_grad():
+            lambda_regions = net.lambda_floor + F.softplus(net.raw_lambda_params)
+            mu_regions = net.mu_floor + F.softplus(net.raw_mu_params)
+        region_payload = {
+            "lambda_regions": [float(v) for v in lambda_regions.detach().cpu().numpy().tolist()],
+            "mu_regions": [float(v) for v in mu_regions.detach().cpu().numpy().tolist()],
+            "num_regions": int(net.num_regions),
+        }
+        save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
+        save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
 
 
 def latest_model_prefix(model_dir, prefix_name):
@@ -917,7 +1083,73 @@ def split_residual_prediction(residual_prediction):
     return array
 
 
+def _predict_compact_raw(model, points, batch_size=4096):
+    net = model.net
+    device = next(net.parameters()).device
+    outputs = []
+    net.eval()
+    for start in range(0, len(points), batch_size):
+        batch_points = points[start : start + batch_size]
+        x = torch.tensor(batch_points, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            batch_output = net(x)
+        outputs.append(batch_output.detach().cpu().numpy())
+    return np.concatenate(outputs, axis=0)
+
+
+def _predict_compact_full_fields(model, points, args, batch_size=2048):
+    net = model.net
+    device = next(net.parameters()).device
+    predictions = []
+    net.eval()
+    for start in range(0, len(points), batch_size):
+        batch_points = points[start : start + batch_size]
+        x = torch.tensor(batch_points, dtype=torch.float32, device=device, requires_grad=True)
+        raw = net(x)
+        ux = raw[:, 0:1]
+        uy = raw[:, 1:2]
+        lmbd = raw[:, 2:3]
+        mu = raw[:, 3:4]
+        ux_grad = torch.autograd.grad(ux, x, grad_outputs=torch.ones_like(ux), create_graph=False, retain_graph=True)[0]
+        uy_grad = torch.autograd.grad(uy, x, grad_outputs=torch.ones_like(uy), create_graph=False, retain_graph=False)[0]
+        exx = ux_grad[:, 0:1]
+        eyy = uy_grad[:, 1:2]
+        exy = 0.5 * (ux_grad[:, 1:2] + uy_grad[:, 0:1])
+        sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+        syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+        sxy = 2.0 * mu * exy
+        predictions.append(torch.cat((ux, uy, sxx, syy, sxy, lmbd, mu), dim=1).detach().cpu().numpy())
+    return np.concatenate(predictions, axis=0)
+
+
+def predict_material_diagnostics(model, points, args, batch_size=4096):
+    if not is_compact_material_method(args.method) or not hasattr(model.net, "predict_material_diagnostics"):
+        return None
+    net = model.net
+    device = next(net.parameters()).device
+    interface_indicator_batches = []
+    class_prob_batches = []
+    net.eval()
+    for start in range(0, len(points), batch_size):
+        batch_points = points[start : start + batch_size]
+        x = torch.tensor(batch_points, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            diagnostics = net.predict_material_diagnostics(x)
+        interface_indicator_batches.append(diagnostics["interface_indicator"].detach().cpu().numpy())
+        class_prob_batches.append(diagnostics["class_probs"].detach().cpu().numpy())
+    with torch.no_grad():
+        summary = net.predict_material_diagnostics(torch.tensor(points[: min(len(points), 1)], dtype=torch.float32, device=device))
+    return {
+        "interface_indicator": np.concatenate(interface_indicator_batches, axis=0),
+        "class_probs": np.concatenate(class_prob_batches, axis=0),
+        "lambda_regions": summary["lambda_regions"].detach().cpu().numpy(),
+        "mu_regions": summary["mu_regions"].detach().cpu().numpy(),
+    }
+
+
 def predict_full_fields(model, points, args, batch_size=4096):
+    if is_compact_material_method(args.method):
+        return _predict_compact_full_fields(model, points, args, batch_size=batch_size)
     return np.asarray(model.predict(points))
 
 
@@ -1072,7 +1304,7 @@ def plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name):
     plt.close(fig)
 
 
-def plot_observation_fit(save_dir, observation_truth, observation_prediction):
+def plot_observation_fit(save_dir, observation_truth, observation_prediction, filename="observation_fit.png"):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
     for axis, index, label in zip(axes, [0, 1], ["ux", "uy"]):
         axis.scatter(
@@ -1092,7 +1324,25 @@ def plot_observation_fit(save_dir, observation_truth, observation_prediction):
         axis.set_title(f"Observation fit for {label}")
         axis.grid(True, alpha=0.2)
     plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", "observation_fit.png"), dpi=300)
+    plt.savefig(_get_save_path(save_dir, "png", filename), dpi=300)
+    plt.close(fig)
+
+
+def plot_interface_diagnostics(save_dir, xx, yy, interface_indicator_grid, class_probability_grid, split_name):
+    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.5))
+    for axis, grid, title in zip(
+        axes,
+        [interface_indicator_grid, class_probability_grid],
+        ["Interface indicator", "Region probability"],
+    ):
+        image = axis.contourf(xx, yy, grid, levels=100, cmap="coolwarm")
+        axis.set_title(title)
+        axis.set_xlabel("x")
+        axis.set_ylabel("y")
+        axis.set_aspect("equal")
+        plt.colorbar(image, ax=axis)
+    plt.tight_layout()
+    plt.savefig(_get_save_path(save_dir, "png", f"{split_name}_interface_diagnostics.png"), dpi=300)
     plt.close(fig)
 
 
@@ -1113,6 +1363,7 @@ def evaluate_model(
         model.predict(eval_points, operator=build_pde(case_config, args.reg_weight, args.method))
     )
     observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
+    material_diagnostics = predict_material_diagnostics(model, eval_points, args)
 
     metrics = compute_metrics(
         prediction=prediction,
@@ -1123,17 +1374,18 @@ def evaluate_model(
     )
 
     if save_artifacts:
+        prediction_prefix = f"{observation_split_name}_predictions"
         save_prediction_data(
             eval_points,
             prediction,
             truth,
             test_delta=None,
             save_dir=save_dir,
-            prefix="evaluation_predictions",
+            prefix=prediction_prefix,
             field_names=FIELD_NAMES,
         )
         np.savez(
-            _get_save_path(save_dir, "npz", "evaluation_grid.npz"),
+            _get_save_path(save_dir, "npz", f"{observation_split_name}_grid.npz"),
             points=eval_points,
             prediction=prediction,
             truth=truth,
@@ -1142,15 +1394,57 @@ def evaluate_model(
             pde_residual=residual,
         )
         save_json(_get_save_path(save_dir, "metrics", f"{observation_split_name}_metrics.json"), metrics)
+        save_metrics_text(_get_save_path(save_dir, "metrics", f"{observation_split_name}_metrics.txt"), metrics)
+        np.savez(
+            _get_save_path(save_dir, "npz", f"{observation_split_name}_observation_fit.npz"),
+            points=observation_points,
+            prediction=observation_prediction,
+            truth=observation_truth_clean,
+        )
+        save_array_txt(
+            _get_save_path(save_dir, "txt", f"{observation_split_name}_observation_fit.txt"),
+            np.concatenate([observation_points, observation_truth_clean, observation_prediction], axis=1),
+            "x y true_ux true_uy pred_ux pred_uy",
+        )
 
         for index, field_name in enumerate(FIELD_NAMES):
             truth_grid = reshape_grid(truth[:, index], args.eval_ny, args.eval_nx)
             pred_grid = reshape_grid(prediction[:, index], args.eval_ny, args.eval_nx)
-            plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name)
+            plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, f"{observation_split_name}_{field_name}")
             if field_name in MATERIAL_FIELD_NAMES:
-                plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name)
+                plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, f"{observation_split_name}_{field_name}")
 
-        plot_observation_fit(save_dir, observation_truth_clean, observation_prediction)
+        if material_diagnostics is not None:
+            interface_indicator_grid = reshape_grid(material_diagnostics["interface_indicator"][:, 0], args.eval_ny, args.eval_nx)
+            class_probability_grid = reshape_grid(material_diagnostics["class_probs"][:, -1], args.eval_ny, args.eval_nx)
+            np.savez(
+                _get_save_path(save_dir, "npz", f"{observation_split_name}_interface_diagnostics.npz"),
+                interface_indicator=material_diagnostics["interface_indicator"],
+                class_probs=material_diagnostics["class_probs"],
+                lambda_regions=material_diagnostics["lambda_regions"],
+                mu_regions=material_diagnostics["mu_regions"],
+            )
+            plot_interface_diagnostics(
+                save_dir,
+                xx,
+                yy,
+                interface_indicator_grid,
+                class_probability_grid,
+                observation_split_name,
+            )
+            save_json(
+                _get_save_path(save_dir, "json", f"{observation_split_name}_interface_summary.json"),
+                {
+                    "lambda_regions": material_diagnostics["lambda_regions"].tolist(),
+                    "mu_regions": material_diagnostics["mu_regions"].tolist(),
+                },
+            )
+        plot_observation_fit(
+            save_dir,
+            observation_truth_clean,
+            observation_prediction,
+            filename=f"{observation_split_name}_observation_fit.png",
+        )
     return metrics
 
 
@@ -1205,7 +1499,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn", "iaminn"],
+        choices=["pinn", "iaminn_v2"],
         default="pinn",
     )
     parser.add_argument(
@@ -1232,12 +1526,13 @@ def build_common_parser(description):
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
     parser.add_argument("--state_layers", type=str, default="128,128,128,128")
-    parser.add_argument("--interface_layers", type=str, default="64,64,64")
+    parser.add_argument("--interface_layers", type=str, default="128,128,128,128")
     parser.add_argument("--interface_sharpness", type=float, default=10.0)
     parser.add_argument("--num_frequencies", type=int, default=4)
     parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
     parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
+    parser.add_argument("--experiment_group", type=str, default=None)
     parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--save_dir", type=str, default=None)
     parser.add_argument("--model_path", type=str, default=None)

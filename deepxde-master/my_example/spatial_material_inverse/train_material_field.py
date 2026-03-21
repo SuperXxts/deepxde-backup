@@ -87,6 +87,29 @@ def main():
             observation_split_name="evaluation_last",
             save_artifacts=False,
         )
+        summary["post_train_metrics_last_by_split"] = {
+            "train": evaluate_model(
+                args=args,
+                model=model,
+                save_dir=args.save_dir,
+                case_config=case_config,
+                observation_points=metadata["train_observation"]["points"],
+                observation_truth_clean=metadata["train_observation"]["clean"],
+                observation_split_name="train_last",
+                save_artifacts=False,
+            ),
+            "validation": evaluate_model(
+                args=args,
+                model=model,
+                save_dir=args.save_dir,
+                case_config=case_config,
+                observation_points=metadata["val_observation"]["points"],
+                observation_truth_clean=metadata["val_observation"]["clean"],
+                observation_split_name="validation_last",
+                save_artifacts=False,
+            ),
+            "evaluation": summary["post_train_metrics_last"],
+        }
         summary["observation_mse_last_by_split"] = {
             "train": compute_observation_mse(model, args, metadata["train_observation"]["points"], metadata["train_observation"]["clean"]),
             "validation": compute_observation_mse(model, args, metadata["val_observation"]["points"], metadata["val_observation"]["clean"]),
@@ -96,16 +119,40 @@ def main():
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
         model.restore(summary["best_model_path"], verbose=1)
-        summary["post_train_metrics_best"] = evaluate_model(
-            args=args,
-            model=model,
-            save_dir=args.save_dir,
-            case_config=case_config,
-            observation_points=metadata["eval_observation"]["points"],
-            observation_truth_clean=metadata["eval_observation"]["clean"],
-            observation_split_name="evaluation",
-            save_artifacts=True,
-        )
+        summary["post_train_metrics_best_by_split"] = {
+            "train": evaluate_model(
+                args=args,
+                model=model,
+                save_dir=args.save_dir,
+                case_config=case_config,
+                observation_points=metadata["train_observation"]["points"],
+                observation_truth_clean=metadata["train_observation"]["clean"],
+                observation_split_name="train",
+                save_artifacts=True,
+            ),
+            "validation": evaluate_model(
+                args=args,
+                model=model,
+                save_dir=args.save_dir,
+                case_config=case_config,
+                observation_points=metadata["val_observation"]["points"],
+                observation_truth_clean=metadata["val_observation"]["clean"],
+                observation_split_name="validation",
+                save_artifacts=True,
+            ),
+            "evaluation": evaluate_model(
+                args=args,
+                model=model,
+                save_dir=args.save_dir,
+                case_config=case_config,
+                observation_points=metadata["eval_observation"]["points"],
+                observation_truth_clean=metadata["eval_observation"]["clean"],
+                observation_split_name="evaluation",
+                save_artifacts=True,
+            ),
+        }
+        summary["post_train_metrics_best"] = summary["post_train_metrics_best_by_split"]["evaluation"]
+        summary["post_train_metrics"] = summary["post_train_metrics_best"]
         summary["observation_mse_best_by_split"] = {
             "train": compute_observation_mse(model, args, metadata["train_observation"]["points"], metadata["train_observation"]["clean"]),
             "validation": compute_observation_mse(model, args, metadata["val_observation"]["points"], metadata["val_observation"]["clean"]),
@@ -114,7 +161,8 @@ def main():
         summary["validation_selection_mse_best"] = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
-        summary["post_train_metrics"] = summary["post_train_metrics_best"]
+    else:
+        summary["post_train_metrics_best"] = None
 
     save_json(os.path.join(args.save_dir, "json", "train_summary.json"), summary)
 
