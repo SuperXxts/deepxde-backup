@@ -70,6 +70,14 @@
 |---|---|---|
 | A0 | `DirectionA-v1` | 状态场网络 + 界面网络 + 区域材料参数 |
 
+当前代码中的原型方法名为：
+
+- `iaminn`
+
+含义可理解为：
+
+- `Interface-Aware Material Inference Neural Network`
+
 ### 4.3 方向 A 消融版本
 
 | 编号 | 方法 | 目的 |
