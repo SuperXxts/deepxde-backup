@@ -70,6 +70,14 @@ def parse_args():
     parser.add_argument("--material_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--main_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--freeze_state_material_stage", action="store_true")
+    parser.add_argument('--refinement_stage_iterations', type=int, default=0)
+    parser.add_argument('--refinement_stage_lr', type=float, default=2e-4)
+    parser.add_argument('--refinement_stage_physics_scale', type=float, default=1.0)
+    parser.add_argument('--refinement_stage_reg_scale', type=float, default=1.0)
+    parser.add_argument('--refinement_stage_data_scale', type=float, default=1.0)
+    parser.add_argument('--refinement_stage_boundary_scale', type=float, default=1.0)
+    parser.add_argument('--freeze_geometry_refinement', action='store_true')
+    parser.add_argument('--refinement_stage_interface_sharpness', type=float, default=-1.0)
     return parser.parse_args()
 
 
@@ -509,7 +517,9 @@ def main():
         geometry_stage_iterations = min(max(args.geometry_stage_iterations, 0), max(remaining_iterations - 1, 0))
         remaining_iterations -= geometry_stage_iterations
         material_stage_iterations = min(max(args.material_stage_iterations, 0), max(remaining_iterations - 1, 0))
-        main_iterations = args.iterations - warmup_iterations - geometry_stage_iterations - material_stage_iterations
+        remaining_iterations -= material_stage_iterations
+        refinement_stage_iterations = min(max(args.refinement_stage_iterations, 0), max(remaining_iterations - 1, 0))
+        main_iterations = args.iterations - warmup_iterations - geometry_stage_iterations - material_stage_iterations - refinement_stage_iterations
         if warmup_iterations > 0:
             if args.freeze_material_warmup:
                 set_material_branch_trainable(net, False)
@@ -532,6 +542,7 @@ def main():
                     "warmup_iterations": warmup_iterations,
                     "geometry_stage_iterations": geometry_stage_iterations,
                     "material_stage_iterations": material_stage_iterations,
+                    "refinement_stage_iterations": refinement_stage_iterations,
                     "main_iterations": main_iterations,
                     "warmup_lr": args.warmup_lr,
                     "main_lr": args.main_lr,
@@ -566,6 +577,13 @@ def main():
                     "material_stage_interface_sharpness": args.material_stage_interface_sharpness,
                     "main_stage_interface_sharpness": args.main_stage_interface_sharpness,
                     "freeze_state_material_stage": args.freeze_state_material_stage,
+                    "refinement_stage_lr": args.refinement_stage_lr,
+                    "refinement_stage_physics_scale": args.refinement_stage_physics_scale,
+                    "refinement_stage_reg_scale": args.refinement_stage_reg_scale,
+                    "refinement_stage_data_scale": args.refinement_stage_data_scale,
+                    "refinement_stage_boundary_scale": args.refinement_stage_boundary_scale,
+                    "freeze_geometry_refinement": args.freeze_geometry_refinement,
+                    "refinement_stage_interface_sharpness": args.refinement_stage_interface_sharpness,
                 },
             )
             set_material_branch_trainable(net, True)
@@ -578,15 +596,45 @@ def main():
         if args.freeze_geometry_main:
             set_geometry_branch_trainable(net, False)
             set_region_parameter_trainable(net, True)
-        if hasattr(net, "interface_sharpness") and args.main_stage_interface_sharpness > 0:
+        original_sharpness = getattr(net, 'interface_sharpness', None)
+        if hasattr(net, 'interface_sharpness') and args.main_stage_interface_sharpness > 0:
             net.interface_sharpness = float(args.main_stage_interface_sharpness)
         model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
         callbacks = make_callbacks(args, args.save_dir, metadata)
-        losshistory, train_state = model.train(
+        main_history, train_state = model.train(
             iterations=max(main_iterations, 1),
             display_every=args.display_every,
             callbacks=callbacks,
         )
+        losshistory = main_history
+        if refinement_stage_iterations > 0:
+            save_stage_loss_artifacts(main_history, args.save_dir, 'main')
+            if args.freeze_geometry_refinement:
+                set_geometry_branch_trainable(net, False)
+                set_region_parameter_trainable(net, True)
+            if original_sharpness is not None and args.refinement_stage_interface_sharpness > 0:
+                net.interface_sharpness = float(args.refinement_stage_interface_sharpness)
+            refinement_weights = resolve_loss_weights(
+                args,
+                physics_scale=args.refinement_stage_physics_scale,
+                reg_scale=args.refinement_stage_reg_scale,
+                data_scale=args.refinement_stage_data_scale,
+                boundary_scale=args.refinement_stage_boundary_scale,
+            )
+            model.compile("adam", lr=args.refinement_stage_lr, loss_weights=refinement_weights)
+            refinement_callbacks = make_callbacks(args, args.save_dir, metadata)
+            refinement_history, train_state = model.train(
+                iterations=refinement_stage_iterations,
+                display_every=max(100, min(args.display_every, refinement_stage_iterations)),
+                callbacks=refinement_callbacks,
+            )
+            save_stage_loss_artifacts(refinement_history, args.save_dir, 'refinement')
+            losshistory = refinement_history
+            if args.freeze_geometry_refinement:
+                set_geometry_branch_trainable(net, True)
+                set_region_parameter_trainable(net, True)
+        if original_sharpness is not None:
+            net.interface_sharpness = float(original_sharpness)
     else:
         callbacks = make_callbacks(args, args.save_dir, metadata)
         losshistory, train_state = model.train(
