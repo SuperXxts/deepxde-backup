@@ -137,10 +137,10 @@ def save_summary_json(case_name, baseline_name, method_name, baseline_summary, m
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Generate direct comparison figures for PINN vs PI-MINN')
+    parser = argparse.ArgumentParser(description='Generate direct comparison figures for a baseline and a candidate method')
     parser.add_argument('--case', required=True)
     parser.add_argument('--baseline_name', default='PINN')
-    parser.add_argument('--method_name', default='PI-MINN')
+    parser.add_argument('--method_name', default='Candidate method')
     parser.add_argument('--baseline_dir', required=True)
     parser.add_argument('--method_dir', required=True)
     parser.add_argument('--output_dir', required=True)

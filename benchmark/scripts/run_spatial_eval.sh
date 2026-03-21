@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Usage: bash benchmark/scripts/run_spatial_eval.sh --method piminn --case single_inclusion ..."
+  echo "Usage: bash benchmark/scripts/run_spatial_eval.sh --method pinn --case single_inclusion ..."
   exit 1
 fi
 

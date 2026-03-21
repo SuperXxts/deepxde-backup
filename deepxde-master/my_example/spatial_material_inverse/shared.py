@@ -372,44 +372,7 @@ class VanillaMaterialFieldNet(dde.nn.pytorch.nn.NN):
         return outputs
 
 
-class PIMINNNet(dde.nn.pytorch.nn.NN):
-    def __init__(
-        self,
-        state_hidden_layers,
-        material_hidden_layers,
-        activation="tanh",
-        num_frequencies=0,
-    ):
-        super().__init__()
-        self.features = FourierFeatureMap(num_frequencies)
-        feature_dim = self.features.output_dim
-        self.state_net = SimpleMLP(
-            input_dim=feature_dim,
-            hidden_layers=state_hidden_layers,
-            output_dim=5,
-            activation=activation,
-        )
-        self.material_net = SimpleMLP(
-            input_dim=feature_dim,
-            hidden_layers=material_hidden_layers,
-            output_dim=2,
-            activation=activation,
-        )
-
-    def forward(self, inputs):
-        x = inputs
-        if self._input_transform is not None:
-            x = self._input_transform(inputs)
-        features = self.features(x)
-        state = self.state_net(features)
-        material = self.material_net(features)
-        outputs = torch.cat((state, material), dim=1)
-        if self._output_transform is not None:
-            outputs = self._output_transform(inputs, outputs)
-        return outputs
-
-
-def make_output_transform(lambda_floor, mu_floor):
+def make_output_transform(lambda_floor, mu_floor, method=None):
     def output_transform(inputs, outputs):
         gate = (
             inputs[:, 0:1]
@@ -434,44 +397,41 @@ def count_trainable_parameters(net):
 
 
 def build_network(args):
-    if args.method == "piminn":
-        net = PIMINNNet(
-            state_hidden_layers=parse_hidden_layers(args.state_layers),
-            material_hidden_layers=parse_hidden_layers(args.material_layers),
-            activation=args.activation,
-            num_frequencies=args.num_frequencies,
-        )
-    else:
-        net = VanillaMaterialFieldNet(
-            hidden_layers=parse_hidden_layers(args.hidden_layers),
-            activation=args.activation,
-            num_frequencies=args.num_frequencies,
-        )
-    net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor))
+    net = VanillaMaterialFieldNet(
+        hidden_layers=parse_hidden_layers(args.hidden_layers),
+        activation=args.activation,
+        num_frequencies=args.num_frequencies,
+    )
+    net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method))
     return net
 
 
-def build_pde(case_config, reg_weight):
+
+def build_pde(case_config, reg_weight, method=None):
     def pde(x, y):
         ux_x = dde.grad.jacobian(y, x, i=0, j=0)
         ux_y = dde.grad.jacobian(y, x, i=0, j=1)
         uy_x = dde.grad.jacobian(y, x, i=1, j=0)
         uy_y = dde.grad.jacobian(y, x, i=1, j=1)
-
-        sxx_x = dde.grad.jacobian(y, x, i=2, j=0)
-        syy_y = dde.grad.jacobian(y, x, i=3, j=1)
-        sxy_x = dde.grad.jacobian(y, x, i=4, j=0)
-        sxy_y = dde.grad.jacobian(y, x, i=4, j=1)
-
         exx = ux_x
         eyy = uy_y
         exy = 0.5 * (ux_y + uy_x)
-        lmbd = y[:, 5:6]
-        mu = y[:, 6:7]
+        lambda_idx, mu_idx = 5, 6
+        lmbd = y[:, lambda_idx:lambda_idx + 1]
+        mu = y[:, mu_idx:mu_idx + 1]
 
         constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
         constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
         constitutive_sxy = 2.0 * mu * exy
+
+        sxx = y[:, 2:3]
+        syy = y[:, 3:4]
+        sxy = y[:, 4:5]
+
+        sxx_x = dde.grad.jacobian(sxx, x, i=0, j=0)
+        syy_y = dde.grad.jacobian(syy, x, i=0, j=1)
+        sxy_x = dde.grad.jacobian(sxy, x, i=0, j=0)
+        sxy_y = dde.grad.jacobian(sxy, x, i=0, j=1)
 
         fx, fy = exact_body_force_torch(x, case_config)
         residuals = [
@@ -484,10 +444,10 @@ def build_pde(case_config, reg_weight):
         if reg_weight > 0.0:
             residuals.extend(
                 [
-                    dde.grad.jacobian(y, x, i=5, j=0),
-                    dde.grad.jacobian(y, x, i=5, j=1),
-                    dde.grad.jacobian(y, x, i=6, j=0),
-                    dde.grad.jacobian(y, x, i=6, j=1),
+                    dde.grad.jacobian(y, x, i=lambda_idx, j=0),
+                    dde.grad.jacobian(y, x, i=lambda_idx, j=1),
+                    dde.grad.jacobian(y, x, i=mu_idx, j=0),
+                    dde.grad.jacobian(y, x, i=mu_idx, j=1),
                 ]
             )
         return residuals
@@ -495,20 +455,14 @@ def build_pde(case_config, reg_weight):
     return pde
 
 
-def pde_loss_names(reg_weight):
-    names = [
-        "momentum_x",
-        "momentum_y",
-        "constitutive_xx",
-        "constitutive_yy",
-        "constitutive_xy",
-    ]
+def pde_loss_names(reg_weight, method=None):
+    names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
     if reg_weight > 0.0:
         names.extend(["lambda_x", "lambda_y", "mu_x", "mu_y"])
     return names
 
 
-def pde_loss_weights(reg_weight):
+def pde_loss_weights(reg_weight, method=None):
     weights = [1.0, 1.0, 1.0, 1.0, 1.0]
     if reg_weight > 0.0:
         weights.extend([reg_weight, reg_weight, reg_weight, reg_weight])
@@ -526,7 +480,7 @@ def build_data(args, case_config):
     observe_uy = dde.icbc.PointSetBC(observation_points, noisy_observation[:, 1:2], component=1)
     data = dde.data.PDE(
         geom,
-        build_pde(case_config, args.reg_weight),
+        build_pde(case_config, args.reg_weight, args.method),
         [observe_ux, observe_uy],
         num_domain=args.num_domain,
         num_boundary=0,
@@ -634,7 +588,7 @@ def save_training_artifacts(
         "case": asdict(case_config),
         "parameter_count": count_trainable_parameters(net),
         "field_names": FIELD_NAMES,
-        "pde_loss_names": pde_loss_names(args.reg_weight),
+        "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
         "bc_loss_names": ["obs_ux", "obs_uy"],
     }
     save_json(_get_save_path(save_dir, "json", "run_config.json"), config_payload)
@@ -661,7 +615,7 @@ def save_training_artifacts(
             losshistory,
             save_dir,
             filename="loss_history.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight)),
+            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
             num_bc_losses=2,
             pde_label="Physics Loss",
             bc_label="Observation Loss",
@@ -672,9 +626,9 @@ def save_training_artifacts(
             losshistory,
             save_dir,
             filename="loss_components.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight)),
+            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
             num_bc_losses=2,
-            pde_loss_names=pde_loss_names(args.reg_weight),
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
             bc_loss_names=["obs_ux", "obs_uy"],
         )
         save_loss_history_json(losshistory, save_dir, filename="loss_history.json")
@@ -739,6 +693,10 @@ def split_residual_prediction(residual_prediction):
     if array.ndim == 1:
         return array[:, None]
     return array
+
+
+def predict_full_fields(model, points, args, batch_size=4096):
+    return np.asarray(model.predict(points))
 
 
 def reshape_grid(values, ny, nx):
@@ -821,14 +779,15 @@ def evaluate_model(
     case_config,
     observation_points,
     observation_truth_clean,
+    save_artifacts=True,
 ):
     eval_points, xx, yy = make_grid(args.eval_nx, args.eval_ny)
     truth = exact_state_numpy(eval_points, case_config)
-    prediction = np.asarray(model.predict(eval_points))
+    prediction = predict_full_fields(model, eval_points, args)
     residual = split_residual_prediction(
-        model.predict(eval_points, operator=build_pde(case_config, args.reg_weight))
+        model.predict(eval_points, operator=build_pde(case_config, args.reg_weight, args.method))
     )
-    observation_prediction = np.asarray(model.predict(observation_points))[:, :2]
+    observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
 
     metrics = compute_metrics(
         prediction=prediction,
@@ -838,47 +797,48 @@ def evaluate_model(
         pde_residual=residual,
     )
 
-    save_prediction_data(
-        eval_points,
-        prediction,
-        truth,
-        test_delta=None,
-        save_dir=save_dir,
-        prefix="evaluation_predictions",
-        field_names=FIELD_NAMES,
-    )
-    np.savez(
-        _get_save_path(save_dir, "npz", "evaluation_grid.npz"),
-        points=eval_points,
-        prediction=prediction,
-        truth=truth,
-        xx=xx,
-        yy=yy,
-        pde_residual=residual,
-    )
-    save_json(_get_save_path(save_dir, "metrics", "evaluation_metrics.json"), metrics)
+    if save_artifacts:
+        save_prediction_data(
+            eval_points,
+            prediction,
+            truth,
+            test_delta=None,
+            save_dir=save_dir,
+            prefix="evaluation_predictions",
+            field_names=FIELD_NAMES,
+        )
+        np.savez(
+            _get_save_path(save_dir, "npz", "evaluation_grid.npz"),
+            points=eval_points,
+            prediction=prediction,
+            truth=truth,
+            xx=xx,
+            yy=yy,
+            pde_residual=residual,
+        )
+        save_json(_get_save_path(save_dir, "metrics", "evaluation_metrics.json"), metrics)
 
-    for index, field_name in enumerate(FIELD_NAMES):
-        truth_grid = reshape_grid(truth[:, index], args.eval_ny, args.eval_nx)
-        pred_grid = reshape_grid(prediction[:, index], args.eval_ny, args.eval_nx)
-        plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name)
-        if field_name in MATERIAL_FIELD_NAMES:
-            plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name)
+        for index, field_name in enumerate(FIELD_NAMES):
+            truth_grid = reshape_grid(truth[:, index], args.eval_ny, args.eval_nx)
+            pred_grid = reshape_grid(prediction[:, index], args.eval_ny, args.eval_nx)
+            plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name)
+            if field_name in MATERIAL_FIELD_NAMES:
+                plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name)
 
-    plot_observation_fit(save_dir, observation_truth_clean, observation_prediction)
+        plot_observation_fit(save_dir, observation_truth_clean, observation_prediction)
     return metrics
 
 
 def build_model(args, data):
     net = build_network(args)
     model = dde.Model(data, net)
-    loss_weights = pde_loss_weights(args.reg_weight) + [args.data_weight, args.data_weight]
+    loss_weights = pde_loss_weights(args.reg_weight, args.method) + [args.data_weight, args.data_weight]
     model.compile("adam", lr=args.lr, loss_weights=loss_weights)
     return model, net
 
 
 def make_callbacks(args, save_dir):
-    num_pde = len(pde_loss_names(args.reg_weight))
+    num_pde = len(pde_loss_names(args.reg_weight, args.method))
     model_dir = ensure_dir(os.path.join(save_dir, "model"))
     callbacks = [
         LossHistoryCallback(
@@ -887,7 +847,7 @@ def make_callbacks(args, save_dir):
             filename="loss_history.png",
             num_pde_losses=num_pde,
             num_bc_losses=2,
-            pde_loss_names=pde_loss_names(args.reg_weight),
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
             bc_loss_names=["obs_ux", "obs_uy"],
             pde_label="Physics Loss",
             bc_label="Observation Loss",
@@ -915,7 +875,11 @@ def save_last_model(model, save_dir):
 
 def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--method", choices=["pinn", "piminn"], default="piminn")
+    parser.add_argument(
+        "--method",
+        choices=["pinn"],
+        default="pinn",
+    )
     parser.add_argument(
         "--case",
         choices=["layered", "single_inclusion", "double_inclusion"],
@@ -935,8 +899,6 @@ def build_common_parser(description):
     parser.add_argument("--mu_floor", type=float, default=0.1)
     parser.add_argument("--activation", type=str, default="tanh")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
-    parser.add_argument("--state_layers", type=str, default="128,128,128,128")
-    parser.add_argument("--material_layers", type=str, default="64,64,64")
     parser.add_argument("--num_frequencies", type=int, default=4)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
     parser.add_argument("--run_name", type=str, default=None)

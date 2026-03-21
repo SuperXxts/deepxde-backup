@@ -78,12 +78,12 @@ def plot_model_architecture(output_dir):
         ),
         (
             axes[1],
-            "PI-MINN",
+            "Direction A concept",
             [
                 (0.12, 0.50, "Input\n(x, y)"),
                 (0.42, 0.68, "State net\nux, uy, sxx, syy, sxy"),
-                (0.42, 0.32, "Material net\nlambda, mu"),
-                (0.78, 0.50, "Physics coupling\nMomentum + constitutive + obs"),
+                (0.42, 0.32, "Interface net\nphi(x, y)"),
+                (0.78, 0.50, "Material mixing\nbg/inc params\n+ physics loss"),
             ],
         ),
     ]

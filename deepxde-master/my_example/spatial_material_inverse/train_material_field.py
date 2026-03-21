@@ -9,6 +9,7 @@ from shared import (
     build_model,
     count_trainable_parameters,
     evaluate_model,
+    find_model_path,
     make_callbacks,
     pde_loss_names,
     prepare_run,
@@ -56,18 +57,32 @@ def main():
         "seed": args.seed,
         "num_observe": args.num_observe,
         "noise_level": args.noise_level,
-        "pde_loss_names": pde_loss_names(args.reg_weight),
+        "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
     }
 
     if args.run_eval_after_train:
-        summary["post_train_metrics"] = evaluate_model(
+        summary["last_model_path"] = find_model_path(args.save_dir, prefer="last_model")
+        summary["best_model_path"] = find_model_path(args.save_dir, prefer="best_model")
+        summary["post_train_metrics_last"] = evaluate_model(
             args=args,
             model=model,
             save_dir=args.save_dir,
             case_config=case_config,
             observation_points=metadata["observation_points"],
             observation_truth_clean=metadata["observation_clean"],
+            save_artifacts=False,
         )
+        model.restore(summary["best_model_path"], verbose=1)
+        summary["post_train_metrics_best"] = evaluate_model(
+            args=args,
+            model=model,
+            save_dir=args.save_dir,
+            case_config=case_config,
+            observation_points=metadata["observation_points"],
+            observation_truth_clean=metadata["observation_clean"],
+            save_artifacts=True,
+        )
+        summary["post_train_metrics"] = summary["post_train_metrics_best"]
 
     save_json(os.path.join(args.save_dir, "json", "train_summary.json"), summary)
 

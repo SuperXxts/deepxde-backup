@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
-  echo "Usage: bash benchmark/scripts/launch_spatial_eval_screen.sh <screen_name> <device_id> --method piminn --case single_inclusion ..."
+  echo "Usage: bash benchmark/scripts/launch_spatial_eval_screen.sh <screen_name> <device_id> --method pinn --case single_inclusion ..."
   exit 1
 fi
 
