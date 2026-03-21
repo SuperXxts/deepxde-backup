@@ -525,6 +525,128 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         }
 
 
+def bounded_sigmoid(raw_value, lower, upper):
+    return lower + (upper - lower) * torch.sigmoid(raw_value)
+
+
+class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
+    def __init__(
+        self,
+        case_name,
+        state_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        interface_sharpness=40.0,
+    ):
+        super().__init__()
+        self.features = FourierFeatureMap(num_frequencies)
+        self.case_name = case_name
+        self.num_regions = num_regions_for_case(case_name)
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.interface_sharpness = float(interface_sharpness)
+        self.state_net = SimpleMLP(
+            input_dim=self.features.output_dim,
+            hidden_layers=state_hidden_layers,
+            output_dim=2,
+            activation=activation,
+        )
+        lambda_init = torch.linspace(-0.35, 0.35, steps=self.num_regions + 1, dtype=torch.float32)
+        mu_init = torch.linspace(-0.2, 0.2, steps=self.num_regions + 1, dtype=torch.float32)
+        self.raw_lambda_params = nn.Parameter(lambda_init.clone())
+        self.raw_mu_params = nn.Parameter(mu_init.clone())
+
+        if case_name == "layered":
+            self.raw_layer_y = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        elif case_name == "single_inclusion":
+            self.raw_circle_1_cx = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.raw_circle_1_cy = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+            self.raw_circle_1_r = nn.Parameter(torch.tensor(-0.2, dtype=torch.float32))
+        elif case_name == "double_inclusion":
+            self.raw_circle_1_cx = nn.Parameter(torch.tensor(-0.25, dtype=torch.float32))
+            self.raw_circle_1_cy = nn.Parameter(torch.tensor(0.15, dtype=torch.float32))
+            self.raw_circle_1_r = nn.Parameter(torch.tensor(-0.2, dtype=torch.float32))
+            self.raw_circle_2_cx = nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+            self.raw_circle_2_cy = nn.Parameter(torch.tensor(-0.15, dtype=torch.float32))
+            self.raw_circle_2_r = nn.Parameter(torch.tensor(-0.35, dtype=torch.float32))
+        else:
+            raise ValueError(f"Unsupported case: {case_name}")
+
+    def _geometry_logits(self, inputs):
+        x = inputs[:, 0:1]
+        y = inputs[:, 1:2]
+        if self.case_name == "layered":
+            layer_y = bounded_sigmoid(self.raw_layer_y, 0.15, 0.85)
+            indicator = y - layer_y
+            region_probability = torch.sigmoid(self.interface_sharpness * indicator)
+            class_probs = torch.cat((1.0 - region_probability, region_probability), dim=1)
+            geometry = {"layer_y": layer_y}
+            return indicator, class_probs, geometry
+
+        if self.case_name == "single_inclusion":
+            cx = bounded_sigmoid(self.raw_circle_1_cx, 0.2, 0.8)
+            cy = bounded_sigmoid(self.raw_circle_1_cy, 0.2, 0.8)
+            radius = bounded_sigmoid(self.raw_circle_1_r, 0.08, 0.35)
+            signed_distance = radius**2 - ((x - cx) ** 2 + (y - cy) ** 2)
+            region_probability = torch.sigmoid(self.interface_sharpness * signed_distance)
+            class_probs = torch.cat((1.0 - region_probability, region_probability), dim=1)
+            geometry = {"circle_1_cx": cx, "circle_1_cy": cy, "circle_1_r": radius}
+            return signed_distance, class_probs, geometry
+
+        cx1 = bounded_sigmoid(self.raw_circle_1_cx, 0.15, 0.55)
+        cy1 = bounded_sigmoid(self.raw_circle_1_cy, 0.45, 0.85)
+        r1 = bounded_sigmoid(self.raw_circle_1_r, 0.08, 0.24)
+        cx2 = bounded_sigmoid(self.raw_circle_2_cx, 0.45, 0.85)
+        cy2 = bounded_sigmoid(self.raw_circle_2_cy, 0.15, 0.55)
+        r2 = bounded_sigmoid(self.raw_circle_2_r, 0.06, 0.18)
+        logit_1 = self.interface_sharpness * (r1**2 - ((x - cx1) ** 2 + (y - cy1) ** 2))
+        logit_2 = self.interface_sharpness * (r2**2 - ((x - cx2) ** 2 + (y - cy2) ** 2))
+        background_logit = torch.zeros_like(logit_1)
+        class_probs = torch.softmax(torch.cat((background_logit, logit_1, logit_2), dim=1), dim=1)
+        geometry = {
+            "circle_1_cx": cx1,
+            "circle_1_cy": cy1,
+            "circle_1_r": r1,
+            "circle_2_cx": cx2,
+            "circle_2_cy": cy2,
+            "circle_2_r": r2,
+        }
+        return logit_1, class_probs, geometry
+
+    def _material_from_inputs(self, inputs):
+        interface_indicator, class_probs, geometry = self._geometry_logits(inputs)
+        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
+        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+        lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
+        mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+        return lmbd, mu, interface_indicator, class_probs, geometry
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        state_outputs = self.state_net(features)
+        lmbd, mu, _, _, _ = self._material_from_inputs(inputs)
+        outputs = torch.cat((state_outputs, lmbd, mu), dim=1)
+        return outputs
+
+    def predict_material_diagnostics(self, inputs):
+        lmbd, mu, interface_indicator, class_probs, geometry = self._material_from_inputs(inputs)
+        diagnostics = {
+            "lambda": lmbd,
+            "mu": mu,
+            "interface_indicator": interface_indicator,
+            "class_probs": class_probs,
+            "lambda_regions": self.lambda_floor + F.softplus(self.raw_lambda_params),
+            "mu_regions": self.mu_floor + F.softplus(self.raw_mu_params),
+        }
+        diagnostics.update(geometry)
+        return diagnostics
+
+
 def make_output_transform(lambda_floor, mu_floor, method=None):
     def output_transform(inputs, outputs):
         ux = outputs[:, 0:1]
@@ -544,7 +666,7 @@ def count_trainable_parameters(net):
 
 
 def is_compact_material_method(method):
-    return method == "iaminn_v2"
+    return method in {"iaminn_v2", "geoiaminn"}
 
 
 def build_network(args):
@@ -553,6 +675,16 @@ def build_network(args):
             case_name=args.case,
             state_hidden_layers=parse_hidden_layers(args.state_layers),
             interface_hidden_layers=parse_hidden_layers(args.interface_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            interface_sharpness=args.interface_sharpness,
+        )
+    elif args.method == "geoiaminn":
+        net = GeometryAwareMaterialNet(
+            case_name=args.case,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
             activation=args.activation,
             num_frequencies=args.num_frequencies,
             lambda_floor=args.lambda_floor,
@@ -770,6 +902,7 @@ def default_experiment_group(method):
     mapping = {
         "pinn": "PINN-baseline",
         "iaminn_v2": "IAMINN-v2",
+        "geoiaminn": "GeoIAMINN",
     }
     return mapping.get(method, method.upper())
 
@@ -1045,6 +1178,21 @@ def save_training_artifacts(
             "mu_regions": [float(v) for v in mu_regions.detach().cpu().numpy().tolist()],
             "num_regions": int(net.num_regions),
         }
+        save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
+        save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
+    elif args.method == "geoiaminn" and hasattr(net, "predict_material_diagnostics"):
+        device = next(net.parameters()).device
+        with torch.no_grad():
+            diagnostics = net.predict_material_diagnostics(torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device))
+        region_payload = {
+            "lambda_regions": [float(v) for v in diagnostics["lambda_regions"].detach().cpu().numpy().tolist()],
+            "mu_regions": [float(v) for v in diagnostics["mu_regions"].detach().cpu().numpy().tolist()],
+            "num_regions": int(net.num_regions),
+        }
+        for key, value in diagnostics.items():
+            if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
+                continue
+            region_payload[key] = float(value.detach().cpu().item())
         save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
         save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
 
@@ -1463,6 +1611,19 @@ def evaluate_model(
                 {
                     "lambda_regions": material_diagnostics["lambda_regions"].tolist(),
                     "mu_regions": material_diagnostics["mu_regions"].tolist(),
+                    **{
+                        key: float(value.detach().cpu().item())
+                        for key, value in material_diagnostics.items()
+                        if key
+                        not in {
+                            "lambda",
+                            "mu",
+                            "interface_indicator",
+                            "class_probs",
+                            "lambda_regions",
+                            "mu_regions",
+                        }
+                    },
                 },
             )
         plot_observation_fit(
@@ -1525,7 +1686,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn", "iaminn_v2"],
+        choices=["pinn", "iaminn_v2", "geoiaminn"],
         default="pinn",
     )
     parser.add_argument(

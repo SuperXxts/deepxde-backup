@@ -2,6 +2,8 @@ import json
 import os
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 from shared import (
     build_common_parser,
@@ -10,12 +12,16 @@ from shared import (
     compute_observation_mse,
     count_trainable_parameters,
     evaluate_model,
+    exact_body_force_torch,
     find_model_path,
+    is_compact_material_method,
     make_callbacks,
     pde_loss_names,
     prepare_run,
     resolve_loss_weights,
+    save_array_txt,
     save_json,
+    save_text,
     save_last_model,
     save_loss_history_dat,
     save_loss_history_json,
@@ -34,6 +40,14 @@ def parse_args():
     parser.add_argument("--warmup_physics_scale", type=float, default=0.0)
     parser.add_argument("--warmup_reg_scale", type=float, default=0.0)
     parser.add_argument("--freeze_material_warmup", action="store_true")
+    parser.add_argument("--material_stage_iterations", type=int, default=0)
+    parser.add_argument("--material_stage_lr", type=float, default=8e-4)
+    parser.add_argument("--material_stage_physics_scale", type=float, default=0.05)
+    parser.add_argument("--material_stage_reg_scale", type=float, default=1.0)
+    parser.add_argument("--material_stage_usage_floor", type=float, default=0.05)
+    parser.add_argument("--material_stage_usage_weight", type=float, default=20.0)
+    parser.add_argument("--material_stage_binary_weight", type=float, default=0.05)
+    parser.add_argument("--freeze_state_material_stage", action="store_true")
     return parser.parse_args()
 
 
@@ -43,12 +57,10 @@ def set_requires_grad(module, flag):
 
 
 def set_material_branch_trainable(net, trainable):
-    if hasattr(net, "interface_net"):
-        set_requires_grad(net.interface_net, trainable)
-    if hasattr(net, "raw_lambda_params"):
-        net.raw_lambda_params.requires_grad = bool(trainable)
-    if hasattr(net, "raw_mu_params"):
-        net.raw_mu_params.requires_grad = bool(trainable)
+    for name, parameter in net.named_parameters():
+        if name.startswith("state_net."):
+            continue
+        parameter.requires_grad = bool(trainable)
 
 
 def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
@@ -57,6 +69,182 @@ def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
     save_loss_history_json(losshistory, save_dir, filename=f"{stage_name}_loss_history.json")
     save_best_test_loss_json(losshistory, save_dir, filename=f"{stage_name}_best_test_loss.json")
     save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
+
+
+def extract_material_stage_points(data, geom, seed, fallback_count):
+    train_x_all = getattr(data, "train_x_all", None)
+    if train_x_all is not None:
+        points = np.asarray(train_x_all, dtype=float)[:, :2]
+        interior_mask = (
+            (points[:, 0] > 1e-8)
+            & (points[:, 0] < 1.0 - 1e-8)
+            & (points[:, 1] > 1e-8)
+            & (points[:, 1] < 1.0 - 1e-8)
+        )
+        interior_points = points[interior_mask]
+        if len(interior_points) > 0:
+            return interior_points
+    np.random.seed(seed)
+    return geom.random_points(fallback_count)
+
+
+def compute_compact_material_stage_terms(net, domain_points, case_config, reg_weight, usage_floor):
+    device = next(net.parameters()).device
+    x = torch.tensor(domain_points, dtype=torch.float32, device=device, requires_grad=True)
+    raw = net(x)
+    ux = raw[:, 0:1]
+    uy = raw[:, 1:2]
+    lmbd = raw[:, 2:3]
+    mu = raw[:, 3:4]
+
+    ux_grad = torch.autograd.grad(ux, x, grad_outputs=torch.ones_like(ux), create_graph=True, retain_graph=True)[0]
+    uy_grad = torch.autograd.grad(uy, x, grad_outputs=torch.ones_like(uy), create_graph=True, retain_graph=True)[0]
+    exx = ux_grad[:, 0:1]
+    eyy = uy_grad[:, 1:2]
+    exy = 0.5 * (ux_grad[:, 1:2] + uy_grad[:, 0:1])
+
+    sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+    syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+    sxy = 2.0 * mu * exy
+
+    sxx_grad = torch.autograd.grad(sxx, x, grad_outputs=torch.ones_like(sxx), create_graph=True, retain_graph=True)[0]
+    syy_grad = torch.autograd.grad(syy, x, grad_outputs=torch.ones_like(syy), create_graph=True, retain_graph=True)[0]
+    sxy_grad = torch.autograd.grad(sxy, x, grad_outputs=torch.ones_like(sxy), create_graph=True, retain_graph=True)[0]
+    fx, fy = exact_body_force_torch(x, case_config)
+    momentum_x = sxx_grad[:, 0:1] + sxy_grad[:, 1:2] + fx
+    momentum_y = sxy_grad[:, 0:1] + syy_grad[:, 1:2] + fy
+
+    lambda_grad = torch.autograd.grad(lmbd, x, grad_outputs=torch.ones_like(lmbd), create_graph=True, retain_graph=True)[0]
+    mu_grad = torch.autograd.grad(mu, x, grad_outputs=torch.ones_like(mu), create_graph=True, retain_graph=True)[0]
+
+    diagnostics = net.predict_material_diagnostics(x)
+    class_probs = diagnostics["class_probs"]
+    mean_probs = torch.mean(class_probs, dim=0)
+    floor = max(float(usage_floor), 1e-8)
+    safe_ratio = torch.clamp(mean_probs / floor, min=1e-8, max=1.0)
+    active_mask = (mean_probs < floor).to(mean_probs.dtype)
+    usage_penalty = torch.mean((-torch.log(safe_ratio)) * active_mask)
+    if class_probs.shape[1] > 1:
+        binary_penalty = torch.mean(class_probs[:, 1:] * (1.0 - class_probs[:, 1:]))
+    else:
+        binary_penalty = torch.zeros((), dtype=torch.float32, device=device)
+
+    reg_terms = torch.cat(
+        [
+            lambda_grad[:, 0:1],
+            lambda_grad[:, 1:2],
+            mu_grad[:, 0:1],
+            mu_grad[:, 1:2],
+        ],
+        dim=1,
+    )
+    reg_mse = torch.mean(reg_terms**2)
+    physics_mse = torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
+
+    return {
+        "physics_mse": physics_mse,
+        "reg_mse": reg_mse,
+        "usage_penalty": usage_penalty,
+        "binary_penalty": binary_penalty,
+        "mean_class_probs": mean_probs,
+        "lambda_regions": diagnostics["lambda_regions"],
+        "mu_regions": diagnostics["mu_regions"],
+        "reg_weight": float(reg_weight),
+    }
+
+
+def run_material_stage(args, net, geom, data, case_config, save_dir):
+    if not is_compact_material_method(args.method) or args.material_stage_iterations <= 0:
+        return None
+
+    stage_points = extract_material_stage_points(
+        data=data,
+        geom=geom,
+        seed=args.seed + 701,
+        fallback_count=max(args.num_domain, 2000),
+    )
+    os.makedirs(os.path.join(save_dir, "npz"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "txt"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "json"), exist_ok=True)
+    np.savez(os.path.join(save_dir, "npz", "material_stage_points.npz"), points=stage_points)
+    save_array_txt(os.path.join(save_dir, "txt", "material_stage_points.txt"), stage_points, "x y")
+
+    state_frozen = bool(args.freeze_state_material_stage)
+    if state_frozen and hasattr(net, "state_net"):
+        set_requires_grad(net.state_net, False)
+    set_material_branch_trainable(net, True)
+
+    parameters = [parameter for parameter in net.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.Adam(parameters, lr=args.material_stage_lr)
+    display_every = max(50, min(args.display_every, args.material_stage_iterations))
+    history_rows = []
+    best_row = None
+
+    for step in range(1, args.material_stage_iterations + 1):
+        optimizer.zero_grad()
+        terms = compute_compact_material_stage_terms(
+            net=net,
+            domain_points=stage_points,
+            case_config=case_config,
+            reg_weight=args.reg_weight,
+            usage_floor=args.material_stage_usage_floor,
+        )
+        total_loss = (
+            float(args.material_stage_physics_scale) * terms["physics_mse"]
+            + float(args.material_stage_reg_scale) * float(args.reg_weight) * terms["reg_mse"]
+            + float(args.material_stage_usage_weight) * terms["usage_penalty"]
+            + float(args.material_stage_binary_weight) * terms["binary_penalty"]
+        )
+        total_loss.backward()
+        optimizer.step()
+
+        row = {
+            "step": int(step),
+            "total_loss": float(total_loss.detach().cpu().item()),
+            "physics_mse": float(terms["physics_mse"].detach().cpu().item()),
+            "reg_mse": float(terms["reg_mse"].detach().cpu().item()),
+            "usage_penalty": float(terms["usage_penalty"].detach().cpu().item()),
+            "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
+            "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
+            "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
+            "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
+        }
+        if best_row is None or row["total_loss"] < best_row["total_loss"]:
+            best_row = dict(row)
+        if step == 1 or step % display_every == 0 or step == args.material_stage_iterations:
+            history_rows.append(row)
+            print(
+                "[material_stage] step={} total={:.4e} physics={:.4e} reg={:.4e} usage={:.4e} binary={:.4e} probs={}".format(
+                    row["step"],
+                    row["total_loss"],
+                    row["physics_mse"],
+                    row["reg_mse"],
+                    row["usage_penalty"],
+                    row["binary_penalty"],
+                    [round(value, 5) for value in row["mean_class_probs"]],
+                )
+            )
+
+    if state_frozen and hasattr(net, "state_net"):
+        set_requires_grad(net.state_net, True)
+
+    history_payload = {
+        "stage_name": "material_stage",
+        "iterations": int(args.material_stage_iterations),
+        "learning_rate": float(args.material_stage_lr),
+        "physics_scale": float(args.material_stage_physics_scale),
+        "reg_scale": float(args.material_stage_reg_scale),
+        "usage_floor": float(args.material_stage_usage_floor),
+        "usage_weight": float(args.material_stage_usage_weight),
+        "binary_weight": float(args.material_stage_binary_weight),
+        "freeze_state": state_frozen,
+        "num_points": int(len(stage_points)),
+        "history": history_rows,
+        "best": best_row,
+    }
+    save_json(os.path.join(save_dir, "json", "material_stage_history.json"), history_payload)
+    save_text(os.path.join(save_dir, "txt", "material_stage_history.txt"), json.dumps(history_payload, indent=2, ensure_ascii=False))
+    return history_payload
 
 
 def main():
@@ -73,9 +261,10 @@ def main():
         args._domain_points_for_plot = geom.random_points(min(args.num_domain, 4000))
 
     losshistory = None
-    if args.method == "iaminn_v2" and args.staged_training and args.iterations > 1:
+    if is_compact_material_method(args.method) and args.staged_training and args.iterations > 1:
         warmup_iterations = min(max(args.warmup_iterations, 0), max(args.iterations - 1, 0))
-        main_iterations = args.iterations - warmup_iterations
+        material_stage_iterations = min(max(args.material_stage_iterations, 0), max(args.iterations - warmup_iterations - 1, 0))
+        main_iterations = args.iterations - warmup_iterations - material_stage_iterations
         if warmup_iterations > 0:
             if args.freeze_material_warmup:
                 set_material_branch_trainable(net, False)
@@ -96,15 +285,26 @@ def main():
                 {
                     "staged_training": True,
                     "warmup_iterations": warmup_iterations,
+                    "material_stage_iterations": material_stage_iterations,
                     "main_iterations": main_iterations,
                     "warmup_lr": args.warmup_lr,
                     "main_lr": args.main_lr,
                     "warmup_physics_scale": args.warmup_physics_scale,
                     "warmup_reg_scale": args.warmup_reg_scale,
                     "freeze_material_warmup": args.freeze_material_warmup,
+                    "material_stage_lr": args.material_stage_lr,
+                    "material_stage_physics_scale": args.material_stage_physics_scale,
+                    "material_stage_reg_scale": args.material_stage_reg_scale,
+                    "material_stage_usage_floor": args.material_stage_usage_floor,
+                    "material_stage_usage_weight": args.material_stage_usage_weight,
+                    "material_stage_binary_weight": args.material_stage_binary_weight,
+                    "freeze_state_material_stage": args.freeze_state_material_stage,
                 },
             )
             set_material_branch_trainable(net, True)
+        material_stage_payload = run_material_stage(args, net, geom, data, case_config, args.save_dir)
+        if material_stage_payload is not None:
+            print("[material_stage] completed with best total loss {:.4e}".format(material_stage_payload["best"]["total_loss"]))
         model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
         callbacks = make_callbacks(args, args.save_dir, metadata)
         losshistory, train_state = model.train(
@@ -139,7 +339,7 @@ def main():
         "observation_split_tag": args.observation_split_tag,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
         "selection_metric": "validation_observation_mse",
-        "staged_training": bool(args.staged_training and args.method == "iaminn_v2"),
+        "staged_training": bool(args.staged_training and is_compact_material_method(args.method)),
     }
 
     if args.run_eval_after_train:
