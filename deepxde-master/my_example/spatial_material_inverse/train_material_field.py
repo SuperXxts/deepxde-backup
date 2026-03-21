@@ -47,6 +47,11 @@ def parse_args():
     parser.add_argument("--material_stage_usage_floor", type=float, default=0.05)
     parser.add_argument("--material_stage_usage_weight", type=float, default=20.0)
     parser.add_argument("--material_stage_binary_weight", type=float, default=0.05)
+    parser.add_argument("--geometry_prior_weight", type=float, default=0.0)
+    parser.add_argument("--layer_y_prior_target", type=float, default=0.5)
+    parser.add_argument("--freeze_geometry_main", action="store_true")
+    parser.add_argument("--material_stage_interface_sharpness", type=float, default=-1.0)
+    parser.add_argument("--main_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--freeze_state_material_stage", action="store_true")
     return parser.parse_args()
 
@@ -61,6 +66,19 @@ def set_material_branch_trainable(net, trainable):
         if name.startswith("state_net."):
             continue
         parameter.requires_grad = bool(trainable)
+
+
+def set_geometry_branch_trainable(net, trainable):
+    geometry_prefixes = ("raw_layer_y", "raw_circle_")
+    for name, parameter in net.named_parameters():
+        if name.startswith(geometry_prefixes):
+            parameter.requires_grad = bool(trainable)
+
+
+def set_region_parameter_trainable(net, trainable):
+    for name, parameter in net.named_parameters():
+        if name in {"raw_lambda_params", "raw_mu_params"}:
+            parameter.requires_grad = bool(trainable)
 
 
 def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
@@ -88,7 +106,7 @@ def extract_material_stage_points(data, geom, seed, fallback_count):
     return geom.random_points(fallback_count)
 
 
-def compute_compact_material_stage_terms(net, domain_points, case_config, reg_weight, usage_floor):
+def compute_compact_material_stage_terms(net, domain_points, case_config, reg_weight, usage_floor, args):
     device = next(net.parameters()).device
     x = torch.tensor(domain_points, dtype=torch.float32, device=device, requires_grad=True)
     raw = net(x)
@@ -140,15 +158,26 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     )
     reg_mse = torch.mean(reg_terms**2)
     physics_mse = torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
+    geometry_prior = torch.zeros((), dtype=torch.float32, device=device)
+    geometry_values = {}
+    for key, value in diagnostics.items():
+        if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
+            continue
+        geometry_values[key] = value
+    if hasattr(net, "case_name") and net.case_name == "layered" and "layer_y" in geometry_values:
+        target = torch.tensor(float(args.layer_y_prior_target), dtype=torch.float32, device=device)
+        geometry_prior = torch.mean((geometry_values["layer_y"] - target) ** 2)
 
     return {
         "physics_mse": physics_mse,
         "reg_mse": reg_mse,
         "usage_penalty": usage_penalty,
         "binary_penalty": binary_penalty,
+        "geometry_prior": geometry_prior,
         "mean_class_probs": mean_probs,
         "lambda_regions": diagnostics["lambda_regions"],
         "mu_regions": diagnostics["mu_regions"],
+        "geometry_values": geometry_values,
         "reg_weight": float(reg_weight),
     }
 
@@ -173,6 +202,9 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
     set_material_branch_trainable(net, True)
+    original_sharpness = getattr(net, "interface_sharpness", None)
+    if original_sharpness is not None and args.material_stage_interface_sharpness > 0:
+        net.interface_sharpness = float(args.material_stage_interface_sharpness)
 
     parameters = [parameter for parameter in net.parameters() if parameter.requires_grad]
     optimizer = torch.optim.Adam(parameters, lr=args.material_stage_lr)
@@ -188,12 +220,14 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             case_config=case_config,
             reg_weight=args.reg_weight,
             usage_floor=args.material_stage_usage_floor,
+            args=args,
         )
         total_loss = (
             float(args.material_stage_physics_scale) * terms["physics_mse"]
             + float(args.material_stage_reg_scale) * float(args.reg_weight) * terms["reg_mse"]
             + float(args.material_stage_usage_weight) * terms["usage_penalty"]
             + float(args.material_stage_binary_weight) * terms["binary_penalty"]
+            + float(args.geometry_prior_weight) * terms["geometry_prior"]
         )
         total_loss.backward()
         optimizer.step()
@@ -205,28 +239,34 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             "reg_mse": float(terms["reg_mse"].detach().cpu().item()),
             "usage_penalty": float(terms["usage_penalty"].detach().cpu().item()),
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
+            "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
         }
+        for key, value in terms["geometry_values"].items():
+            row[key] = float(value.detach().cpu().item())
         if best_row is None or row["total_loss"] < best_row["total_loss"]:
             best_row = dict(row)
         if step == 1 or step % display_every == 0 or step == args.material_stage_iterations:
             history_rows.append(row)
             print(
-                "[material_stage] step={} total={:.4e} physics={:.4e} reg={:.4e} usage={:.4e} binary={:.4e} probs={}".format(
+                "[material_stage] step={} total={:.4e} physics={:.4e} reg={:.4e} usage={:.4e} binary={:.4e} geom={:.4e} probs={}".format(
                     row["step"],
                     row["total_loss"],
                     row["physics_mse"],
                     row["reg_mse"],
                     row["usage_penalty"],
                     row["binary_penalty"],
+                    row["geometry_prior"],
                     [round(value, 5) for value in row["mean_class_probs"]],
                 )
             )
 
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, True)
+    if original_sharpness is not None:
+        net.interface_sharpness = float(original_sharpness)
 
     history_payload = {
         "stage_name": "material_stage",
@@ -237,6 +277,7 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         "usage_floor": float(args.material_stage_usage_floor),
         "usage_weight": float(args.material_stage_usage_weight),
         "binary_weight": float(args.material_stage_binary_weight),
+        "geometry_prior_weight": float(args.geometry_prior_weight),
         "freeze_state": state_frozen,
         "num_points": int(len(stage_points)),
         "history": history_rows,
@@ -298,6 +339,11 @@ def main():
                     "material_stage_usage_floor": args.material_stage_usage_floor,
                     "material_stage_usage_weight": args.material_stage_usage_weight,
                     "material_stage_binary_weight": args.material_stage_binary_weight,
+                    "geometry_prior_weight": args.geometry_prior_weight,
+                    "layer_y_prior_target": args.layer_y_prior_target,
+                    "freeze_geometry_main": args.freeze_geometry_main,
+                    "material_stage_interface_sharpness": args.material_stage_interface_sharpness,
+                    "main_stage_interface_sharpness": args.main_stage_interface_sharpness,
                     "freeze_state_material_stage": args.freeze_state_material_stage,
                 },
             )
@@ -305,6 +351,11 @@ def main():
         material_stage_payload = run_material_stage(args, net, geom, data, case_config, args.save_dir)
         if material_stage_payload is not None:
             print("[material_stage] completed with best total loss {:.4e}".format(material_stage_payload["best"]["total_loss"]))
+        if args.freeze_geometry_main:
+            set_geometry_branch_trainable(net, False)
+            set_region_parameter_trainable(net, True)
+        if hasattr(net, "interface_sharpness") and args.main_stage_interface_sharpness > 0:
+            net.interface_sharpness = float(args.main_stage_interface_sharpness)
         model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
         callbacks = make_callbacks(args, args.save_dir, metadata)
         losshistory, train_state = model.train(
