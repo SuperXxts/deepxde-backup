@@ -40,6 +40,18 @@ def parse_args():
     parser.add_argument("--warmup_physics_scale", type=float, default=0.0)
     parser.add_argument("--warmup_reg_scale", type=float, default=0.0)
     parser.add_argument("--freeze_material_warmup", action="store_true")
+    parser.add_argument("--geometry_stage_iterations", type=int, default=0)
+    parser.add_argument("--geometry_stage_lr", type=float, default=8e-4)
+    parser.add_argument("--geometry_stage_physics_scale", type=float, default=0.02)
+    parser.add_argument("--geometry_stage_reg_scale", type=float, default=0.0)
+    parser.add_argument("--geometry_stage_data_scale", type=float, default=1.0)
+    parser.add_argument("--geometry_stage_boundary_scale", type=float, default=1.0)
+    parser.add_argument("--geometry_stage_balance_target", type=float, default=0.5)
+    parser.add_argument("--geometry_stage_balance_weight", type=float, default=0.0)
+    parser.add_argument("--geometry_stage_binary_weight", type=float, default=0.0)
+    parser.add_argument("--geometry_stage_interface_sharpness", type=float, default=-1.0)
+    parser.add_argument("--freeze_region_geometry_stage", action="store_true")
+    parser.add_argument("--freeze_state_geometry_stage", action="store_true")
     parser.add_argument("--material_stage_iterations", type=int, default=0)
     parser.add_argument("--material_stage_lr", type=float, default=8e-4)
     parser.add_argument("--material_stage_physics_scale", type=float, default=0.05)
@@ -49,6 +61,8 @@ def parse_args():
     parser.add_argument("--material_stage_binary_weight", type=float, default=0.05)
     parser.add_argument("--geometry_prior_weight", type=float, default=0.0)
     parser.add_argument("--layer_y_prior_target", type=float, default=0.5)
+    parser.add_argument("--layer_y_init", type=float, default=-1.0)
+    parser.add_argument("--freeze_geometry_material_stage", action="store_true")
     parser.add_argument("--freeze_geometry_main", action="store_true")
     parser.add_argument("--material_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--main_stage_interface_sharpness", type=float, default=-1.0)
@@ -79,6 +93,24 @@ def set_region_parameter_trainable(net, trainable):
     for name, parameter in net.named_parameters():
         if name in {"raw_lambda_params", "raw_mu_params"}:
             parameter.requires_grad = bool(trainable)
+
+
+def mean_squared_error(prediction, target):
+    if prediction.numel() == 0:
+        return torch.zeros((), dtype=prediction.dtype, device=prediction.device)
+    return torch.mean((prediction - target) ** 2)
+
+
+def bounded_logit(target, lower, upper):
+    clipped = min(max(float(target), lower + 1e-6), upper - 1e-6)
+    normalized = (clipped - lower) / (upper - lower)
+    return float(np.log(normalized / (1.0 - normalized)))
+
+
+def initialize_geometry_parameters(args, net):
+    if getattr(args, "layer_y_init", -1.0) > 0 and hasattr(net, "raw_layer_y"):
+        raw_value = bounded_logit(args.layer_y_init, 0.15, 0.85)
+        net.raw_layer_y.data.fill_(raw_value)
 
 
 def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
@@ -182,6 +214,150 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     }
 
 
+def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
+    if not is_compact_material_method(args.method) or args.geometry_stage_iterations <= 0:
+        return None
+
+    stage_points = extract_material_stage_points(
+        data=data,
+        geom=geom,
+        seed=args.seed + 651,
+        fallback_count=max(args.num_domain, 2000),
+    )
+    os.makedirs(os.path.join(save_dir, "npz"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "txt"), exist_ok=True)
+    os.makedirs(os.path.join(save_dir, "json"), exist_ok=True)
+    np.savez(os.path.join(save_dir, "npz", "geometry_stage_points.npz"), points=stage_points)
+    save_array_txt(os.path.join(save_dir, "txt", "geometry_stage_points.txt"), stage_points, "x y")
+
+    device = next(net.parameters()).device
+    observation_points = np.asarray(metadata["train_observation"]["points"], dtype=float)
+    observation_values = np.asarray(metadata["train_observation"]["noisy"], dtype=float)
+    boundary_points = np.asarray(metadata["boundary_observation"]["points"], dtype=float)
+    boundary_values = np.asarray(metadata["boundary_observation"]["clean"], dtype=float)
+
+    observation_points_t = torch.tensor(observation_points, dtype=torch.float32, device=device)
+    observation_values_t = torch.tensor(observation_values, dtype=torch.float32, device=device)
+    boundary_points_t = torch.tensor(boundary_points, dtype=torch.float32, device=device)
+    boundary_values_t = torch.tensor(boundary_values, dtype=torch.float32, device=device)
+
+    state_frozen = bool(args.freeze_state_geometry_stage)
+    region_frozen = bool(args.freeze_region_geometry_stage)
+    if hasattr(net, "state_net"):
+        set_requires_grad(net.state_net, not state_frozen)
+    set_material_branch_trainable(net, True)
+    if region_frozen:
+        set_region_parameter_trainable(net, False)
+    set_geometry_branch_trainable(net, True)
+
+    original_sharpness = getattr(net, "interface_sharpness", None)
+    if original_sharpness is not None and args.geometry_stage_interface_sharpness > 0:
+        net.interface_sharpness = float(args.geometry_stage_interface_sharpness)
+
+    parameters = [parameter for parameter in net.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.Adam(parameters, lr=args.geometry_stage_lr)
+    display_every = max(50, min(args.display_every, args.geometry_stage_iterations))
+    history_rows = []
+    best_row = None
+
+    for step in range(1, args.geometry_stage_iterations + 1):
+        optimizer.zero_grad()
+        terms = compute_compact_material_stage_terms(
+            net=net,
+            domain_points=stage_points,
+            case_config=case_config,
+            reg_weight=args.reg_weight,
+            usage_floor=args.material_stage_usage_floor,
+            args=args,
+        )
+
+        observation_prediction = net(observation_points_t)[:, :2]
+        boundary_prediction = net(boundary_points_t)[:, :2]
+        data_mse = mean_squared_error(observation_prediction, observation_values_t)
+        boundary_mse = mean_squared_error(boundary_prediction, boundary_values_t)
+
+        if terms["mean_class_probs"].numel() >= 2:
+            balance_penalty = torch.mean(
+                (terms["mean_class_probs"][1:] - float(args.geometry_stage_balance_target)) ** 2
+            )
+        else:
+            balance_penalty = torch.zeros((), dtype=torch.float32, device=device)
+
+        total_loss = (
+            float(args.geometry_stage_physics_scale) * terms["physics_mse"]
+            + float(args.geometry_stage_reg_scale) * float(args.reg_weight) * terms["reg_mse"]
+            + float(args.data_weight) * float(args.geometry_stage_data_scale) * data_mse
+            + float(args.boundary_weight) * float(args.geometry_stage_boundary_scale) * boundary_mse
+            + float(args.geometry_stage_binary_weight) * terms["binary_penalty"]
+            + float(args.geometry_stage_balance_weight) * balance_penalty
+            + float(args.geometry_prior_weight) * terms["geometry_prior"]
+        )
+        total_loss.backward()
+        optimizer.step()
+
+        row = {
+            "step": int(step),
+            "total_loss": float(total_loss.detach().cpu().item()),
+            "physics_mse": float(terms["physics_mse"].detach().cpu().item()),
+            "reg_mse": float(terms["reg_mse"].detach().cpu().item()),
+            "data_mse": float(data_mse.detach().cpu().item()),
+            "boundary_mse": float(boundary_mse.detach().cpu().item()),
+            "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
+            "balance_penalty": float(balance_penalty.detach().cpu().item()),
+            "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
+            "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
+            "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
+            "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
+        }
+        for key, value in terms["geometry_values"].items():
+            row[key] = float(value.detach().cpu().item())
+        if best_row is None or row["total_loss"] < best_row["total_loss"]:
+            best_row = dict(row)
+        if step == 1 or step % display_every == 0 or step == args.geometry_stage_iterations:
+            history_rows.append(row)
+            print(
+                "[geometry_stage] step={} total={:.4e} physics={:.4e} data={:.4e} bc={:.4e} binary={:.4e} balance={:.4e} geom={:.4e} probs={}".format(
+                    row["step"],
+                    row["total_loss"],
+                    row["physics_mse"],
+                    row["data_mse"],
+                    row["boundary_mse"],
+                    row["binary_penalty"],
+                    row["balance_penalty"],
+                    row["geometry_prior"],
+                    [round(value, 5) for value in row["mean_class_probs"]],
+                )
+            )
+
+    if hasattr(net, "state_net"):
+        set_requires_grad(net.state_net, True)
+    set_region_parameter_trainable(net, True)
+    if original_sharpness is not None:
+        net.interface_sharpness = float(original_sharpness)
+
+    history_payload = {
+        "stage_name": "geometry_stage",
+        "iterations": int(args.geometry_stage_iterations),
+        "learning_rate": float(args.geometry_stage_lr),
+        "physics_scale": float(args.geometry_stage_physics_scale),
+        "reg_scale": float(args.geometry_stage_reg_scale),
+        "data_scale": float(args.geometry_stage_data_scale),
+        "boundary_scale": float(args.geometry_stage_boundary_scale),
+        "balance_target": float(args.geometry_stage_balance_target),
+        "balance_weight": float(args.geometry_stage_balance_weight),
+        "binary_weight": float(args.geometry_stage_binary_weight),
+        "geometry_prior_weight": float(args.geometry_prior_weight),
+        "freeze_state": state_frozen,
+        "freeze_region": region_frozen,
+        "num_points": int(len(stage_points)),
+        "history": history_rows,
+        "best": best_row,
+    }
+    save_json(os.path.join(save_dir, "json", "geometry_stage_history.json"), history_payload)
+    save_text(os.path.join(save_dir, "txt", "geometry_stage_history.txt"), json.dumps(history_payload, indent=2, ensure_ascii=False))
+    return history_payload
+
+
 def run_material_stage(args, net, geom, data, case_config, save_dir):
     if not is_compact_material_method(args.method) or args.material_stage_iterations <= 0:
         return None
@@ -202,6 +378,9 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
     set_material_branch_trainable(net, True)
+    if args.freeze_geometry_material_stage:
+        set_geometry_branch_trainable(net, False)
+        set_region_parameter_trainable(net, True)
     original_sharpness = getattr(net, "interface_sharpness", None)
     if original_sharpness is not None and args.material_stage_interface_sharpness > 0:
         net.interface_sharpness = float(args.material_stage_interface_sharpness)
@@ -265,6 +444,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
 
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, True)
+    set_geometry_branch_trainable(net, True)
+    set_region_parameter_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
 
@@ -294,6 +475,7 @@ def main():
 
     geom, data, metadata = build_data(args, case_config)
     model, net = build_model(args, data)
+    initialize_geometry_parameters(args, net)
 
     if hasattr(data, "train_x_all") and data.train_x_all is not None:
         train_x_all = np.asarray(data.train_x_all)
@@ -304,8 +486,11 @@ def main():
     losshistory = None
     if is_compact_material_method(args.method) and args.staged_training and args.iterations > 1:
         warmup_iterations = min(max(args.warmup_iterations, 0), max(args.iterations - 1, 0))
-        material_stage_iterations = min(max(args.material_stage_iterations, 0), max(args.iterations - warmup_iterations - 1, 0))
-        main_iterations = args.iterations - warmup_iterations - material_stage_iterations
+        remaining_iterations = args.iterations - warmup_iterations
+        geometry_stage_iterations = min(max(args.geometry_stage_iterations, 0), max(remaining_iterations - 1, 0))
+        remaining_iterations -= geometry_stage_iterations
+        material_stage_iterations = min(max(args.material_stage_iterations, 0), max(remaining_iterations - 1, 0))
+        main_iterations = args.iterations - warmup_iterations - geometry_stage_iterations - material_stage_iterations
         if warmup_iterations > 0:
             if args.freeze_material_warmup:
                 set_material_branch_trainable(net, False)
@@ -326,6 +511,7 @@ def main():
                 {
                     "staged_training": True,
                     "warmup_iterations": warmup_iterations,
+                    "geometry_stage_iterations": geometry_stage_iterations,
                     "material_stage_iterations": material_stage_iterations,
                     "main_iterations": main_iterations,
                     "warmup_lr": args.warmup_lr,
@@ -333,6 +519,17 @@ def main():
                     "warmup_physics_scale": args.warmup_physics_scale,
                     "warmup_reg_scale": args.warmup_reg_scale,
                     "freeze_material_warmup": args.freeze_material_warmup,
+                    "geometry_stage_lr": args.geometry_stage_lr,
+                    "geometry_stage_physics_scale": args.geometry_stage_physics_scale,
+                    "geometry_stage_reg_scale": args.geometry_stage_reg_scale,
+                    "geometry_stage_data_scale": args.geometry_stage_data_scale,
+                    "geometry_stage_boundary_scale": args.geometry_stage_boundary_scale,
+                    "geometry_stage_balance_target": args.geometry_stage_balance_target,
+                    "geometry_stage_balance_weight": args.geometry_stage_balance_weight,
+                    "geometry_stage_binary_weight": args.geometry_stage_binary_weight,
+                    "geometry_stage_interface_sharpness": args.geometry_stage_interface_sharpness,
+                    "freeze_region_geometry_stage": args.freeze_region_geometry_stage,
+                    "freeze_state_geometry_stage": args.freeze_state_geometry_stage,
                     "material_stage_lr": args.material_stage_lr,
                     "material_stage_physics_scale": args.material_stage_physics_scale,
                     "material_stage_reg_scale": args.material_stage_reg_scale,
@@ -341,6 +538,8 @@ def main():
                     "material_stage_binary_weight": args.material_stage_binary_weight,
                     "geometry_prior_weight": args.geometry_prior_weight,
                     "layer_y_prior_target": args.layer_y_prior_target,
+                    "layer_y_init": args.layer_y_init,
+                    "freeze_geometry_material_stage": args.freeze_geometry_material_stage,
                     "freeze_geometry_main": args.freeze_geometry_main,
                     "material_stage_interface_sharpness": args.material_stage_interface_sharpness,
                     "main_stage_interface_sharpness": args.main_stage_interface_sharpness,
@@ -348,6 +547,9 @@ def main():
                 },
             )
             set_material_branch_trainable(net, True)
+        geometry_stage_payload = run_geometry_stage(args, net, geom, data, case_config, metadata, args.save_dir)
+        if geometry_stage_payload is not None:
+            print("[geometry_stage] completed with best total loss {:.4e}".format(geometry_stage_payload["best"]["total_loss"]))
         material_stage_payload = run_material_stage(args, net, geom, data, case_config, args.save_dir)
         if material_stage_payload is not None:
             print("[material_stage] completed with best total loss {:.4e}".format(material_stage_payload["best"]["total_loss"]))
