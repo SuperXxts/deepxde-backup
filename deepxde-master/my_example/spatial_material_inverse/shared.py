@@ -477,8 +477,10 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
             output_dim=self.num_regions,
             activation=activation,
         )
-        self.raw_lambda_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
-        self.raw_mu_params = nn.Parameter(torch.zeros(self.num_regions + 1, dtype=torch.float32))
+        lambda_init = torch.linspace(-0.35, 0.35, steps=self.num_regions + 1, dtype=torch.float32)
+        mu_init = torch.linspace(-0.2, 0.2, steps=self.num_regions + 1, dtype=torch.float32)
+        self.raw_lambda_params = nn.Parameter(lambda_init.clone())
+        self.raw_mu_params = nn.Parameter(mu_init.clone())
 
     def _material_from_features(self, features):
         region_logits = self.interface_sharpness * self.interface_net(features)
@@ -665,6 +667,30 @@ def pde_loss_weights(reg_weight, method=None):
     return weights
 
 
+def resolve_loss_weights(
+    args,
+    physics_scale=1.0,
+    reg_scale=1.0,
+    boundary_scale=1.0,
+    data_scale=1.0,
+):
+    weights = []
+    for loss_name in pde_loss_names(args.reg_weight, args.method):
+        if loss_name in {"momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"}:
+            weights.append(float(physics_scale))
+        else:
+            weights.append(float(args.reg_weight) * float(reg_scale))
+    weights.extend(
+        [
+            float(args.boundary_weight) * float(boundary_scale),
+            float(args.boundary_weight) * float(boundary_scale),
+            float(args.data_weight) * float(data_scale),
+            float(args.data_weight) * float(data_scale),
+        ]
+    )
+    return weights
+
+
 def build_observation_payload(points, case_config, noise_level, seed):
     if len(points) == 0:
         return {
@@ -825,7 +851,7 @@ def save_observation_split_files(save_dir, split_name, payload):
     save_json(_get_save_path(save_dir, "json", f"{split_name}_set_metadata.json"), metadata)
 
 
-def save_loss_history_dat(losshistory, save_dir):
+def save_loss_history_dat(losshistory, save_dir, filename="loss_history.dat"):
     if losshistory is None:
         return
     steps = np.asarray(getattr(losshistory, "steps", []), dtype=float)
@@ -844,7 +870,7 @@ def save_loss_history_dat(losshistory, save_dir):
     train_headers = [f"train_loss_{idx}" for idx in range(width)]
     test_headers = [f"test_loss_{idx}" for idx in range(width)]
     header = "step " + " ".join(train_headers + test_headers)
-    save_array_txt(_get_save_path(save_dir, "dat", "loss_history.dat"), table, header)
+    save_array_txt(_get_save_path(save_dir, "dat", filename), table, header)
 
 def save_case_and_sampling_figure(
     save_dir,
@@ -1451,7 +1477,7 @@ def evaluate_model(
 def build_model(args, data):
     net = build_network(args)
     model = dde.Model(data, net)
-    loss_weights = pde_loss_weights(args.reg_weight, args.method) + [args.boundary_weight, args.boundary_weight, args.data_weight, args.data_weight]
+    loss_weights = resolve_loss_weights(args)
     model.compile("adam", lr=args.lr, loss_weights=loss_weights)
     return model, net
 

@@ -14,8 +14,12 @@ from shared import (
     make_callbacks,
     pde_loss_names,
     prepare_run,
+    resolve_loss_weights,
     save_json,
     save_last_model,
+    save_loss_history_dat,
+    save_loss_history_json,
+    save_best_test_loss_json,
     save_training_artifacts,
 )
 
@@ -23,7 +27,36 @@ from shared import (
 def parse_args():
     parser = build_common_parser("Train material-field inverse models")
     parser.add_argument("--run_eval_after_train", action="store_true")
+    parser.add_argument("--staged_training", action="store_true")
+    parser.add_argument("--warmup_iterations", type=int, default=1000)
+    parser.add_argument("--warmup_lr", type=float, default=1e-3)
+    parser.add_argument("--main_lr", type=float, default=5e-4)
+    parser.add_argument("--warmup_physics_scale", type=float, default=0.0)
+    parser.add_argument("--warmup_reg_scale", type=float, default=0.0)
+    parser.add_argument("--freeze_material_warmup", action="store_true")
     return parser.parse_args()
+
+
+def set_requires_grad(module, flag):
+    for parameter in module.parameters():
+        parameter.requires_grad = bool(flag)
+
+
+def set_material_branch_trainable(net, trainable):
+    if hasattr(net, "interface_net"):
+        set_requires_grad(net.interface_net, trainable)
+    if hasattr(net, "raw_lambda_params"):
+        net.raw_lambda_params.requires_grad = bool(trainable)
+    if hasattr(net, "raw_mu_params"):
+        net.raw_mu_params.requires_grad = bool(trainable)
+
+
+def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
+    if losshistory is None:
+        return
+    save_loss_history_json(losshistory, save_dir, filename=f"{stage_name}_loss_history.json")
+    save_best_test_loss_json(losshistory, save_dir, filename=f"{stage_name}_best_test_loss.json")
+    save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
 
 
 def main():
@@ -39,12 +72,53 @@ def main():
     else:
         args._domain_points_for_plot = geom.random_points(min(args.num_domain, 4000))
 
-    callbacks = make_callbacks(args, args.save_dir, metadata)
-    losshistory, train_state = model.train(
-        iterations=args.iterations,
-        display_every=args.display_every,
-        callbacks=callbacks,
-    )
+    losshistory = None
+    if args.method == "iaminn_v2" and args.staged_training and args.iterations > 1:
+        warmup_iterations = min(max(args.warmup_iterations, 0), max(args.iterations - 1, 0))
+        main_iterations = args.iterations - warmup_iterations
+        if warmup_iterations > 0:
+            if args.freeze_material_warmup:
+                set_material_branch_trainable(net, False)
+            warmup_weights = resolve_loss_weights(
+                args,
+                physics_scale=args.warmup_physics_scale,
+                reg_scale=args.warmup_reg_scale,
+            )
+            model.compile("adam", lr=args.warmup_lr, loss_weights=warmup_weights)
+            warmup_history, _ = model.train(
+                iterations=warmup_iterations,
+                display_every=max(100, min(args.display_every, warmup_iterations)),
+                callbacks=[],
+            )
+            save_stage_loss_artifacts(warmup_history, args.save_dir, "warmup")
+            save_json(
+                os.path.join(args.save_dir, "json", "stage_training_plan.json"),
+                {
+                    "staged_training": True,
+                    "warmup_iterations": warmup_iterations,
+                    "main_iterations": main_iterations,
+                    "warmup_lr": args.warmup_lr,
+                    "main_lr": args.main_lr,
+                    "warmup_physics_scale": args.warmup_physics_scale,
+                    "warmup_reg_scale": args.warmup_reg_scale,
+                    "freeze_material_warmup": args.freeze_material_warmup,
+                },
+            )
+            set_material_branch_trainable(net, True)
+        model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
+        callbacks = make_callbacks(args, args.save_dir, metadata)
+        losshistory, train_state = model.train(
+            iterations=max(main_iterations, 1),
+            display_every=args.display_every,
+            callbacks=callbacks,
+        )
+    else:
+        callbacks = make_callbacks(args, args.save_dir, metadata)
+        losshistory, train_state = model.train(
+            iterations=args.iterations,
+            display_every=args.display_every,
+            callbacks=callbacks,
+        )
 
     save_last_model(model, args.save_dir)
     save_training_artifacts(args, args.save_dir, case_config, losshistory, metadata, net)
@@ -65,6 +139,7 @@ def main():
         "observation_split_tag": args.observation_split_tag,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
         "selection_metric": "validation_observation_mse",
+        "staged_training": bool(args.staged_training and args.method == "iaminn_v2"),
     }
 
     if args.run_eval_after_train:
