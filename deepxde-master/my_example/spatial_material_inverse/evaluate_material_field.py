@@ -31,8 +31,9 @@ def main():
         model=model,
         save_dir=args.save_dir,
         case_config=case_config,
-        observation_points=metadata["observation_points"],
-        observation_truth_clean=metadata["observation_clean"],
+        observation_points=metadata["eval_observation"]["points"],
+        observation_truth_clean=metadata["eval_observation"]["clean"],
+        observation_split_name="evaluation",
     )
 
     print("=" * 80)

@@ -7,6 +7,7 @@ from shared import (
     build_common_parser,
     build_data,
     build_model,
+    compute_observation_mse,
     count_trainable_parameters,
     evaluate_model,
     find_model_path,
@@ -38,7 +39,7 @@ def main():
     else:
         args._domain_points_for_plot = geom.random_points(min(args.num_domain, 4000))
 
-    callbacks = make_callbacks(args, args.save_dir)
+    callbacks = make_callbacks(args, args.save_dir, metadata)
     losshistory, train_state = model.train(
         iterations=args.iterations,
         display_every=args.display_every,
@@ -56,21 +57,38 @@ def main():
         "iterations": args.iterations,
         "seed": args.seed,
         "num_observe": args.num_observe,
+        "num_val_observe": args.num_val_observe,
+        "num_eval_observe": args.num_eval_observe,
         "noise_level": args.noise_level,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
+        "selection_metric": "validation_observation_mse",
     }
 
     if args.run_eval_after_train:
         summary["last_model_path"] = find_model_path(args.save_dir, prefer="last_model")
         summary["best_model_path"] = find_model_path(args.save_dir, prefer="best_model")
+        summary["observation_split_sizes"] = {
+            "train": int(len(metadata["train_observation"]["points"])),
+            "validation": int(len(metadata["val_observation"]["points"])),
+            "evaluation": int(len(metadata["eval_observation"]["points"])),
+        }
         summary["post_train_metrics_last"] = evaluate_model(
             args=args,
             model=model,
             save_dir=args.save_dir,
             case_config=case_config,
-            observation_points=metadata["observation_points"],
-            observation_truth_clean=metadata["observation_clean"],
+            observation_points=metadata["eval_observation"]["points"],
+            observation_truth_clean=metadata["eval_observation"]["clean"],
+            observation_split_name="evaluation_last",
             save_artifacts=False,
+        )
+        summary["observation_mse_last_by_split"] = {
+            "train": compute_observation_mse(model, args, metadata["train_observation"]["points"], metadata["train_observation"]["clean"]),
+            "validation": compute_observation_mse(model, args, metadata["val_observation"]["points"], metadata["val_observation"]["clean"]),
+            "evaluation": compute_observation_mse(model, args, metadata["eval_observation"]["points"], metadata["eval_observation"]["clean"]),
+        }
+        summary["validation_selection_mse_last"] = compute_observation_mse(
+            model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
         model.restore(summary["best_model_path"], verbose=1)
         summary["post_train_metrics_best"] = evaluate_model(
@@ -78,9 +96,18 @@ def main():
             model=model,
             save_dir=args.save_dir,
             case_config=case_config,
-            observation_points=metadata["observation_points"],
-            observation_truth_clean=metadata["observation_clean"],
+            observation_points=metadata["eval_observation"]["points"],
+            observation_truth_clean=metadata["eval_observation"]["clean"],
+            observation_split_name="evaluation",
             save_artifacts=True,
+        )
+        summary["observation_mse_best_by_split"] = {
+            "train": compute_observation_mse(model, args, metadata["train_observation"]["points"], metadata["train_observation"]["clean"]),
+            "validation": compute_observation_mse(model, args, metadata["val_observation"]["points"], metadata["val_observation"]["clean"]),
+            "evaluation": compute_observation_mse(model, args, metadata["eval_observation"]["points"], metadata["eval_observation"]["clean"]),
+        }
+        summary["validation_selection_mse_best"] = compute_observation_mse(
+            model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
         summary["post_train_metrics"] = summary["post_train_metrics_best"]
 

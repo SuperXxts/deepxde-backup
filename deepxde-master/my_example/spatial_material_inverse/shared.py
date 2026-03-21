@@ -31,7 +31,6 @@ if ROOT_DIR not in sys.path:
 
 import deepxde as dde
 
-from utils.checkpoint_utils import BestModelCheckpoint
 from utils.data_saving_utils import _get_save_path, save_prediction_data
 from utils.device_utils import print_gpu_info, set_random_seed
 from utils.loss_callback import LossHistoryCallback
@@ -280,6 +279,20 @@ def build_observation_points(num_observe, seed):
     return rng.random((num_observe, 2))
 
 
+def build_observation_splits(num_train, num_val, num_eval, seed):
+    total = int(num_train) + int(num_val) + int(num_eval)
+    if total <= 0:
+        raise ValueError("At least one observation point is required.")
+    points = build_observation_points(total, seed)
+    train_end = int(num_train)
+    val_end = train_end + int(num_val)
+    return {
+        "train": points[:train_end],
+        "val": points[train_end:val_end],
+        "eval": points[val_end:],
+    }
+
+
 def add_noise(values, noise_level, seed):
     if noise_level <= 0:
         return values.copy()
@@ -469,15 +482,45 @@ def pde_loss_weights(reg_weight, method=None):
     return weights
 
 
+def build_observation_payload(points, case_config, noise_level, seed):
+    if len(points) == 0:
+        return {
+            "points": np.zeros((0, 2), dtype=float),
+            "clean": np.zeros((0, 2), dtype=float),
+            "noisy": np.zeros((0, 2), dtype=float),
+            "true_state": np.zeros((0, len(FIELD_NAMES)), dtype=float),
+        }
+    exact_observation_state = exact_state_numpy(points, case_config)
+    clean_observation = exact_observation_state[:, :2]
+    noisy_observation = add_noise(clean_observation, noise_level, seed)
+    return {
+        "points": points,
+        "clean": clean_observation,
+        "noisy": noisy_observation,
+        "true_state": exact_observation_state,
+    }
+
+
 def build_data(args, case_config):
     geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
-    observation_points = build_observation_points(args.num_observe, args.seed + 17)
-    exact_observation_state = exact_state_numpy(observation_points, case_config)
-    clean_observation = exact_observation_state[:, :2]
-    noisy_observation = add_noise(clean_observation, args.noise_level, args.seed + 123)
+    observation_splits = build_observation_splits(
+        num_train=args.num_observe,
+        num_val=args.num_val_observe,
+        num_eval=args.num_eval_observe,
+        seed=args.seed + 17,
+    )
+    train_observation = build_observation_payload(
+        observation_splits["train"], case_config, args.noise_level, args.seed + 123
+    )
+    val_observation = build_observation_payload(
+        observation_splits["val"], case_config, args.noise_level, args.seed + 223
+    )
+    eval_observation = build_observation_payload(
+        observation_splits["eval"], case_config, args.noise_level, args.seed + 323
+    )
 
-    observe_ux = dde.icbc.PointSetBC(observation_points, noisy_observation[:, 0:1], component=0)
-    observe_uy = dde.icbc.PointSetBC(observation_points, noisy_observation[:, 1:2], component=1)
+    observe_ux = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 0:1], component=0)
+    observe_uy = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 1:2], component=1)
     data = dde.data.PDE(
         geom,
         build_pde(case_config, args.reg_weight, args.method),
@@ -488,10 +531,9 @@ def build_data(args, case_config):
         train_distribution="pseudo",
     )
     metadata = {
-        "observation_points": observation_points,
-        "observation_clean": clean_observation,
-        "observation_noisy": noisy_observation,
-        "observation_true_state": exact_observation_state,
+        "train_observation": train_observation,
+        "val_observation": val_observation,
+        "eval_observation": eval_observation,
     }
     return geom, data, metadata
 
@@ -501,7 +543,7 @@ def resolve_run_name(args):
         return args.run_name
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return (
-        f"{args.case}_obs{args.num_observe}_noise{args.noise_level:.3f}_"
+        f"{args.case}_obs{args.num_observe}_val{args.num_val_observe}_eval{args.num_eval_observe}_noise{args.noise_level:.3f}_"
         f"seed{args.seed}_iter{args.iterations}_{timestamp}"
     )
 
@@ -532,7 +574,9 @@ def save_case_and_sampling_figure(
     save_dir,
     case_config,
     domain_points,
-    observation_points,
+    train_observation_points,
+    val_observation_points,
+    eval_observation_points,
     title_suffix,
     filename="sampling_and_case.png",
 ):
@@ -555,14 +599,35 @@ def save_case_and_sampling_figure(
         fig.colorbar(image, ax=axis)
 
     axes[2].scatter(domain_points[:, 0], domain_points[:, 1], s=8, alpha=0.25, label="Domain points")
-    axes[2].scatter(
-        observation_points[:, 0],
-        observation_points[:, 1],
-        s=14,
-        alpha=0.85,
-        color="#d97706",
-        label="Observation points",
-    )
+    if len(train_observation_points) > 0:
+        axes[2].scatter(
+            train_observation_points[:, 0],
+            train_observation_points[:, 1],
+            s=18,
+            alpha=0.85,
+            color="#d97706",
+            label="Train observations",
+        )
+    if len(val_observation_points) > 0:
+        axes[2].scatter(
+            val_observation_points[:, 0],
+            val_observation_points[:, 1],
+            s=22,
+            alpha=0.85,
+            color="#0f766e",
+            marker="^",
+            label="Validation observations",
+        )
+    if len(eval_observation_points) > 0:
+        axes[2].scatter(
+            eval_observation_points[:, 0],
+            eval_observation_points[:, 1],
+            s=22,
+            alpha=0.85,
+            color="#7c3aed",
+            marker="s",
+            label="Evaluation observations",
+        )
     axes[2].set_title(f"Sampling layout ({title_suffix})")
     axes[2].set_xlabel("x")
     axes[2].set_ylabel("y")
@@ -590,13 +655,23 @@ def save_training_artifacts(
         "field_names": FIELD_NAMES,
         "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
         "bc_loss_names": ["obs_ux", "obs_uy"],
+        "selection_metric": "validation_observation_mse",
     }
     save_json(_get_save_path(save_dir, "json", "run_config.json"), config_payload)
     np.savez(
         _get_save_path(save_dir, "npz", "observation_data.npz"),
-        observation_points=metadata["observation_points"],
-        observation_clean=metadata["observation_clean"],
-        observation_noisy=metadata["observation_noisy"],
+        train_observation_points=metadata["train_observation"]["points"],
+        train_observation_clean=metadata["train_observation"]["clean"],
+        train_observation_noisy=metadata["train_observation"]["noisy"],
+        train_observation_true_state=metadata["train_observation"]["true_state"],
+        val_observation_points=metadata["val_observation"]["points"],
+        val_observation_clean=metadata["val_observation"]["clean"],
+        val_observation_noisy=metadata["val_observation"]["noisy"],
+        val_observation_true_state=metadata["val_observation"]["true_state"],
+        eval_observation_points=metadata["eval_observation"]["points"],
+        eval_observation_clean=metadata["eval_observation"]["clean"],
+        eval_observation_noisy=metadata["eval_observation"]["noisy"],
+        eval_observation_true_state=metadata["eval_observation"]["true_state"],
     )
 
     domain_points = getattr(args, "_domain_points_for_plot", None)
@@ -606,7 +681,9 @@ def save_training_artifacts(
             save_dir=save_dir,
             case_config=case_config,
             domain_points=domain_points,
-            observation_points=metadata["observation_points"],
+            train_observation_points=metadata["train_observation"]["points"],
+            val_observation_points=metadata["val_observation"]["points"],
+            eval_observation_points=metadata["eval_observation"]["points"],
             title_suffix=args.case,
         )
 
@@ -699,6 +776,108 @@ def predict_full_fields(model, points, args, batch_size=4096):
     return np.asarray(model.predict(points))
 
 
+def compute_observation_mse(model, args, observation_points, observation_truth):
+    if len(observation_points) == 0:
+        return float("nan")
+    observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
+    return float(np.mean((observation_prediction - observation_truth) ** 2))
+
+
+def save_validation_history(history, save_dir):
+    save_json(_get_save_path(save_dir, "json", "validation_history.json"), history)
+    if not history["steps"]:
+        return
+    fig, ax = plt.subplots(figsize=(9.0, 4.8))
+    ax.plot(history["steps"], history["validation_observation_mse"], color="#0f766e", linewidth=2.0)
+    ax.set_xlabel("Steps")
+    ax.set_ylabel("Validation observation MSE")
+    ax.set_title("Validation observation history")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(_get_save_path(save_dir, "png", "validation_history.png"), dpi=300)
+    plt.close(fig)
+
+
+class ValidationObservationCheckpoint(dde.callbacks.Callback):
+    def __init__(self, filepath, save_dir, observation_points, observation_truth_clean, args, period=1, verbose=1):
+        super().__init__()
+        self.filepath = filepath
+        self.save_dir = save_dir
+        self.observation_points = np.asarray(observation_points, dtype=float)
+        self.observation_truth_clean = np.asarray(observation_truth_clean, dtype=float)
+        self.args = args
+        self.period = period
+        self.verbose = verbose
+        self.epochs_since_last_save = 0
+        self.best = np.inf
+        self.best_file = None
+        self.best_step = 0
+        self.history = {
+            "metric_name": "validation_observation_mse",
+            "steps": [],
+            "validation_observation_mse": [],
+        }
+
+    def on_train_begin(self):
+        self._save_history()
+
+    def on_epoch_end(self):
+        self.epochs_since_last_save += 1
+        if self.epochs_since_last_save < self.period:
+            return
+        self.epochs_since_last_save = 0
+        current = compute_observation_mse(
+            self.model,
+            self.args,
+            self.observation_points,
+            self.observation_truth_clean,
+        )
+        step = int(self.model.train_state.iteration)
+        self.history["steps"].append(step)
+        self.history["validation_observation_mse"].append(float(current))
+        self._save_history()
+        if current < self.best:
+            if self.best_file and os.path.exists(self.best_file):
+                try:
+                    os.remove(self.best_file)
+                except OSError:
+                    pass
+            previous_best = self.best
+            save_path = self.model.save(self.filepath, verbose=0)
+            self.best_file = save_path
+            self.best = float(current)
+            self.best_step = step
+            info = {
+                "step": step,
+                "monitor": "validation_observation_mse",
+                "best_value": float(current),
+                "loss_train_components": [float(x) for x in self.model.train_state.loss_train],
+                "loss_test_components": [float(x) for x in self.model.train_state.loss_test]
+                if self.model.train_state.loss_test is not None and len(self.model.train_state.loss_test) > 0
+                else [],
+                "model_path": os.path.basename(save_path),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            save_json(_get_save_path(self.save_dir, "json", "best_validation_info.json"), info)
+            if self.verbose > 0:
+                prev_text = "inf" if not np.isfinite(previous_best) else f"{previous_best:.2e}"
+                print(
+                    "Epoch {}: validation_observation_mse improved from {} to {:.2e}, saving model to {} ...\n".format(
+                        step,
+                        prev_text,
+                        current,
+                        save_path,
+                    )
+                )
+
+    def on_train_end(self):
+        self._save_history()
+
+    def _save_history(self):
+        save_validation_history(self.history, self.save_dir)
+
+
 def reshape_grid(values, ny, nx):
     return values.reshape(ny, nx)
 
@@ -779,6 +958,7 @@ def evaluate_model(
     case_config,
     observation_points,
     observation_truth_clean,
+    observation_split_name="evaluation",
     save_artifacts=True,
 ):
     eval_points, xx, yy = make_grid(args.eval_nx, args.eval_ny)
@@ -816,7 +996,7 @@ def evaluate_model(
             yy=yy,
             pde_residual=residual,
         )
-        save_json(_get_save_path(save_dir, "metrics", "evaluation_metrics.json"), metrics)
+        save_json(_get_save_path(save_dir, "metrics", f"{observation_split_name}_metrics.json"), metrics)
 
         for index, field_name in enumerate(FIELD_NAMES):
             truth_grid = reshape_grid(truth[:, index], args.eval_ny, args.eval_nx)
@@ -837,7 +1017,7 @@ def build_model(args, data):
     return model, net
 
 
-def make_callbacks(args, save_dir):
+def make_callbacks(args, save_dir, metadata):
     num_pde = len(pde_loss_names(args.reg_weight, args.method))
     model_dir = ensure_dir(os.path.join(save_dir, "model"))
     callbacks = [
@@ -853,9 +1033,12 @@ def make_callbacks(args, save_dir):
             bc_label="Observation Loss",
             save_all_components=True,
         ),
-        BestModelCheckpoint(
+        ValidationObservationCheckpoint(
             filepath=os.path.join(model_dir, "best_model"),
-            monitor="test loss",
+            save_dir=save_dir,
+            observation_points=metadata["val_observation"]["points"],
+            observation_truth_clean=metadata["val_observation"]["noisy"],
+            args=args,
             period=args.display_every,
             verbose=1,
         ),
@@ -892,6 +1075,8 @@ def build_common_parser(description):
     parser.add_argument("--num_domain", type=int, default=4000)
     parser.add_argument("--num_test", type=int, default=2000)
     parser.add_argument("--num_observe", type=int, default=500)
+    parser.add_argument("--num_val_observe", type=int, default=100)
+    parser.add_argument("--num_eval_observe", type=int, default=250)
     parser.add_argument("--noise_level", type=float, default=0.0)
     parser.add_argument("--reg_weight", type=float, default=1e-4)
     parser.add_argument("--data_weight", type=float, default=20.0)
@@ -911,6 +1096,10 @@ def build_common_parser(description):
 
 
 def prepare_run(args):
+    if args.num_val_observe <= 0:
+        raise ValueError("num_val_observe must be positive for fair model selection.")
+    if args.num_eval_observe <= 0:
+        raise ValueError("num_eval_observe must be positive for held-out evaluation.")
     set_random_seed(args.seed)
     if args.device_debug:
         print_gpu_info()

@@ -186,6 +186,11 @@
 
 这是正式实验前必须落实的改动。
 
+当前 `PINN baseline` 已经完成这一步，当前流程中：
+
+- `best_model` 基于 `validation_observation_mse`
+- 不再基于 `test loss`
+
 ### F4. 报告平均值和标准差
 
 正式对比不能只报单个 seed 最优结果。
