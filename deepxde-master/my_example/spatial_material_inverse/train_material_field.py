@@ -93,6 +93,8 @@ def parse_args():
     parser.add_argument("--main_correction_scale_start", type=float, default=1.0)
     parser.add_argument("--main_correction_scale_end", type=float, default=1.0)
     parser.add_argument("--main_correction_chunks", type=int, default=1)
+    parser.add_argument("--geometry_stage_domain_points", type=int, default=1024)
+    parser.add_argument("--material_stage_domain_points", type=int, default=1024)
     return parser.parse_args()
 
 
@@ -169,7 +171,7 @@ def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
     save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
 
 
-def extract_material_stage_points(data, geom, seed, fallback_count):
+def extract_material_stage_points(data, geom, seed, fallback_count, max_points=None):
     train_x_all = getattr(data, "train_x_all", None)
     if train_x_all is not None:
         points = np.asarray(train_x_all, dtype=float)[:, :2]
@@ -181,9 +183,19 @@ def extract_material_stage_points(data, geom, seed, fallback_count):
         )
         interior_points = points[interior_mask]
         if len(interior_points) > 0:
-            return interior_points
+            points = interior_points
+            if max_points is not None and len(points) > int(max_points):
+                rng = np.random.default_rng(seed)
+                indices = rng.choice(len(points), size=int(max_points), replace=False)
+                points = points[indices]
+            return points
     np.random.seed(seed)
-    return geom.random_points(fallback_count)
+    points = geom.random_points(fallback_count)
+    if max_points is not None and len(points) > int(max_points):
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(len(points), size=int(max_points), replace=False)
+        points = points[indices]
+    return points
 
 
 def compute_compact_material_stage_terms(net, domain_points, case_config, reg_weight, usage_floor, args):
@@ -281,6 +293,7 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
         geom=geom,
         seed=args.seed + 651,
         fallback_count=max(args.num_domain, 2000),
+        max_points=args.geometry_stage_domain_points,
     )
     os.makedirs(os.path.join(save_dir, "npz"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "txt"), exist_ok=True)
@@ -438,6 +451,7 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         geom=geom,
         seed=args.seed + 701,
         fallback_count=max(args.num_domain, 2000),
+        max_points=args.material_stage_domain_points,
     )
     os.makedirs(os.path.join(save_dir, "npz"), exist_ok=True)
     os.makedirs(os.path.join(save_dir, "txt"), exist_ok=True)
@@ -842,6 +856,8 @@ def main():
                     "main_correction_scale_start": args.main_correction_scale_start,
                     "main_correction_scale_end": args.main_correction_scale_end,
                     "main_correction_chunks": args.main_correction_chunks,
+                    "geometry_stage_domain_points": args.geometry_stage_domain_points,
+                    "material_stage_domain_points": args.material_stage_domain_points,
                 },
             )
             set_material_branch_trainable(net, True)
