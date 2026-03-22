@@ -118,6 +118,12 @@ def set_region_parameter_trainable(net, trainable):
             parameter.requires_grad = bool(trainable)
 
 
+def set_residual_branch_trainable(net, trainable):
+    for name, parameter in net.named_parameters():
+        if name.startswith("residual_net."):
+            parameter.requires_grad = bool(trainable)
+
+
 def mean_squared_error(prediction, target):
     if prediction.numel() == 0:
         return torch.zeros((), dtype=prediction.dtype, device=prediction.device)
@@ -225,10 +231,18 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     physics_mse = torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
     geometry_prior = torch.zeros((), dtype=torch.float32, device=device)
     geometry_values = {}
+    correction_penalty = torch.zeros((), dtype=torch.float32, device=device)
+    correction_gate_mean = torch.zeros((), dtype=torch.float32, device=device)
     for key, value in diagnostics.items():
         if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
             continue
+        if key in {"delta_lambda", "delta_mu", "coarse_lambda", "coarse_mu", "correction_gate"}:
+            continue
         geometry_values[key] = value
+    if "delta_lambda" in diagnostics and "delta_mu" in diagnostics:
+        correction_penalty = torch.mean(diagnostics["delta_lambda"] ** 2 + diagnostics["delta_mu"] ** 2)
+    if "correction_gate" in diagnostics:
+        correction_gate_mean = torch.mean(diagnostics["correction_gate"])
     if hasattr(net, "case_name") and net.case_name == "layered" and "layer_y" in geometry_values:
         target = torch.tensor(float(args.layer_y_prior_target), dtype=torch.float32, device=device)
         geometry_prior = torch.mean((geometry_values["layer_y"] - target) ** 2)
@@ -239,6 +253,8 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
         "usage_penalty": usage_penalty,
         "binary_penalty": binary_penalty,
         "geometry_prior": geometry_prior,
+        "correction_penalty": correction_penalty,
+        "correction_gate_mean": correction_gate_mean,
         "mean_class_probs": mean_probs,
         "lambda_regions": diagnostics["lambda_regions"],
         "mu_regions": diagnostics["mu_regions"],
@@ -279,6 +295,8 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, not state_frozen)
     set_material_branch_trainable(net, True)
+    if hasattr(net, "residual_net"):
+        set_residual_branch_trainable(net, False)
     if region_frozen:
         set_region_parameter_trainable(net, False)
     set_geometry_branch_trainable(net, True)
@@ -338,6 +356,8 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
             "balance_penalty": float(balance_penalty.detach().cpu().item()),
             "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
+            "correction_penalty": float(terms["correction_penalty"].detach().cpu().item()),
+            "correction_gate_mean": float(terms["correction_gate_mean"].detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -365,6 +385,8 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, True)
     set_region_parameter_trainable(net, True)
+    if hasattr(net, "residual_net"):
+        set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
 
@@ -411,6 +433,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
     set_material_branch_trainable(net, True)
+    if hasattr(net, "residual_net"):
+        set_residual_branch_trainable(net, False)
     if args.freeze_geometry_material_stage:
         set_geometry_branch_trainable(net, False)
         set_region_parameter_trainable(net, True)
@@ -464,6 +488,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
             "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
             "contrast_penalty": float(contrast_penalty.detach().cpu().item()),
+            "correction_penalty": float(terms["correction_penalty"].detach().cpu().item()),
+            "correction_gate_mean": float(terms["correction_gate_mean"].detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -492,6 +518,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         set_requires_grad(net.state_net, True)
     set_geometry_branch_trainable(net, True)
     set_region_parameter_trainable(net, True)
+    if hasattr(net, "residual_net"):
+        set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
 

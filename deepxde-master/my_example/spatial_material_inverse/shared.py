@@ -713,6 +713,122 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         return diagnostics
 
 
+def normalized_gate_from_probs(class_probs, mode="none"):
+    if mode == "none":
+        return torch.ones((class_probs.shape[0], 1), dtype=class_probs.dtype, device=class_probs.device)
+    if mode == "uncertainty":
+        max_prob, _ = torch.max(class_probs, dim=1, keepdim=True)
+        denom = max(1.0 - 1.0 / float(class_probs.shape[1]), 1e-6)
+        return torch.clamp((1.0 - max_prob) / denom, 0.0, 1.0)
+    if mode == "entropy":
+        entropy = -torch.sum(class_probs * torch.log(class_probs.clamp_min(1e-8)), dim=1, keepdim=True)
+        max_entropy = math.log(float(class_probs.shape[1]))
+        return torch.clamp(entropy / max(max_entropy, 1e-6), 0.0, 1.0)
+    raise ValueError(f"Unsupported correction_gate_mode: {mode}")
+
+
+class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
+    def __init__(
+        self,
+        case_name,
+        state_hidden_layers,
+        residual_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        residual_num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        interface_sharpness=40.0,
+        correction_mode="multiplicative",
+        correction_gate_mode="uncertainty",
+        correction_lambda_scale=0.25,
+        correction_mu_scale=0.25,
+        backbone_type="mlp",
+    ):
+        super().__init__(
+            case_name=case_name,
+            state_hidden_layers=state_hidden_layers,
+            activation=activation,
+            num_frequencies=num_frequencies,
+            lambda_floor=lambda_floor,
+            mu_floor=mu_floor,
+            interface_sharpness=interface_sharpness,
+            backbone_type=backbone_type,
+        )
+        self.correction_mode = correction_mode
+        self.correction_gate_mode = correction_gate_mode
+        self.correction_lambda_scale = float(correction_lambda_scale)
+        self.correction_mu_scale = float(correction_mu_scale)
+        self.residual_features = FourierFeatureMap(
+            residual_num_frequencies if residual_num_frequencies > 0 else num_frequencies
+        )
+        self.residual_net = build_backbone(
+            input_dim=self.residual_features.output_dim,
+            hidden_layers=residual_hidden_layers,
+            output_dim=2,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+
+    def _material_from_inputs(self, inputs):
+        interface_indicator, class_probs, geometry = self._geometry_logits(inputs)
+        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
+        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+        coarse_lambda = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
+        coarse_mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+
+        residual_features = self.residual_features(inputs)
+        raw_delta = self.residual_net(residual_features)
+        correction_gate = normalized_gate_from_probs(class_probs, mode=self.correction_gate_mode)
+        delta_lambda_raw = torch.tanh(raw_delta[:, 0:1])
+        delta_mu_raw = torch.tanh(raw_delta[:, 1:2])
+
+        if self.correction_mode == "additive":
+            delta_lambda = self.correction_lambda_scale * correction_gate * delta_lambda_raw
+            delta_mu = self.correction_mu_scale * correction_gate * delta_mu_raw
+            lmbd = torch.clamp(coarse_lambda + delta_lambda, min=self.lambda_floor)
+            mu = torch.clamp(coarse_mu + delta_mu, min=self.mu_floor)
+        elif self.correction_mode == "multiplicative":
+            delta_lambda = self.correction_lambda_scale * correction_gate * delta_lambda_raw
+            delta_mu = self.correction_mu_scale * correction_gate * delta_mu_raw
+            lmbd = torch.clamp(coarse_lambda * (1.0 + delta_lambda), min=self.lambda_floor)
+            mu = torch.clamp(coarse_mu * (1.0 + delta_mu), min=self.mu_floor)
+        else:
+            raise ValueError(f"Unsupported correction_mode: {self.correction_mode}")
+
+        return lmbd, mu, interface_indicator, class_probs, geometry, {
+            "coarse_lambda": coarse_lambda,
+            "coarse_mu": coarse_mu,
+            "delta_lambda": delta_lambda,
+            "delta_mu": delta_mu,
+            "correction_gate": correction_gate,
+        }
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        state_outputs = self.state_net(features)
+        lmbd, mu, _, _, _, _ = self._material_from_inputs(inputs)
+        outputs = torch.cat((state_outputs, lmbd, mu), dim=1)
+        return outputs
+
+    def predict_material_diagnostics(self, inputs):
+        lmbd, mu, interface_indicator, class_probs, geometry, correction = self._material_from_inputs(inputs)
+        diagnostics = {
+            "lambda": lmbd,
+            "mu": mu,
+            "interface_indicator": interface_indicator,
+            "class_probs": class_probs,
+            "lambda_regions": self.lambda_floor + F.softplus(self.raw_lambda_params),
+            "mu_regions": self.mu_floor + F.softplus(self.raw_mu_params),
+        }
+        diagnostics.update(geometry)
+        diagnostics.update(correction)
+        return diagnostics
+
+
 def make_output_transform(lambda_floor, mu_floor, method=None):
     def output_transform(inputs, outputs):
         ux = outputs[:, 0:1]
@@ -732,7 +848,7 @@ def count_trainable_parameters(net):
 
 
 def is_compact_material_method(method):
-    return method in {"iaminn_v2", "geoiaminn"}
+    return method in {"iaminn_v2", "geoiaminn", "geocofinet"}
 
 
 def build_network(args):
@@ -746,6 +862,23 @@ def build_network(args):
             lambda_floor=args.lambda_floor,
             mu_floor=args.mu_floor,
             interface_sharpness=args.interface_sharpness,
+            backbone_type=args.backbone_type,
+        )
+    elif args.method == "geocofinet":
+        net = GeometryCoarseToFineMaterialNet(
+            case_name=args.case,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            residual_hidden_layers=parse_hidden_layers(args.residual_hidden_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            residual_num_frequencies=args.residual_num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            interface_sharpness=args.interface_sharpness,
+            correction_mode=args.correction_mode,
+            correction_gate_mode=args.correction_gate_mode,
+            correction_lambda_scale=args.correction_lambda_scale,
+            correction_mu_scale=args.correction_mu_scale,
             backbone_type=args.backbone_type,
         )
     elif args.method == "geoiaminn":
@@ -972,6 +1105,7 @@ def default_experiment_group(method):
         "pinn": "PINN-baseline",
         "iaminn_v2": "IAMINN-v2",
         "geoiaminn": "GeoIAMINN",
+        "geocofinet": "GeoCoFiNet",
     }
     return mapping.get(method, method.upper())
 
@@ -1249,7 +1383,7 @@ def save_training_artifacts(
         }
         save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
         save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
-    elif args.method == "geoiaminn" and hasattr(net, "predict_material_diagnostics"):
+    elif args.method in {"geoiaminn", "geocofinet"} and hasattr(net, "predict_material_diagnostics"):
         device = next(net.parameters()).device
         with torch.no_grad():
             diagnostics = net.predict_material_diagnostics(torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device))
@@ -1755,7 +1889,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn", "iaminn_v2", "geoiaminn"],
+        choices=["pinn", "iaminn_v2", "geoiaminn", "geocofinet"],
         default="pinn",
     )
     parser.add_argument(
@@ -1784,8 +1918,14 @@ def build_common_parser(description):
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
     parser.add_argument("--state_layers", type=str, default="128,128,128,128")
     parser.add_argument("--interface_layers", type=str, default="128,128,128,128")
+    parser.add_argument("--residual_hidden_layers", type=str, default="64,64")
     parser.add_argument("--interface_sharpness", type=float, default=10.0)
     parser.add_argument("--num_frequencies", type=int, default=4)
+    parser.add_argument("--residual_num_frequencies", type=int, default=0)
+    parser.add_argument("--correction_mode", choices=["additive", "multiplicative"], default="multiplicative")
+    parser.add_argument("--correction_gate_mode", choices=["none", "uncertainty", "entropy"], default="uncertainty")
+    parser.add_argument("--correction_lambda_scale", type=float, default=0.25)
+    parser.add_argument("--correction_mu_scale", type=float, default=0.25)
     parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
     parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
