@@ -27,6 +27,8 @@ from shared import (
     save_loss_history_json,
     save_best_test_loss_json,
     save_training_artifacts,
+    plot_all_loss_components,
+    plot_and_save_loss_history,
 )
 
 
@@ -93,6 +95,16 @@ def parse_args():
     parser.add_argument("--main_correction_scale_start", type=float, default=1.0)
     parser.add_argument("--main_correction_scale_end", type=float, default=1.0)
     parser.add_argument("--main_correction_chunks", type=int, default=1)
+    parser.add_argument("--main_stage_physics_scale_start", type=float, default=1.0)
+    parser.add_argument("--main_stage_physics_scale_end", type=float, default=1.0)
+    parser.add_argument("--main_stage_reg_scale_start", type=float, default=1.0)
+    parser.add_argument("--main_stage_reg_scale_end", type=float, default=1.0)
+    parser.add_argument("--main_stage_data_scale_start", type=float, default=1.0)
+    parser.add_argument("--main_stage_data_scale_end", type=float, default=1.0)
+    parser.add_argument("--main_stage_boundary_scale_start", type=float, default=1.0)
+    parser.add_argument("--main_stage_boundary_scale_end", type=float, default=1.0)
+    parser.add_argument("--main_stage_lr_start", type=float, default=-1.0)
+    parser.add_argument("--main_stage_lr_end", type=float, default=-1.0)
     parser.add_argument("--geometry_stage_domain_points", type=int, default=1024)
     parser.add_argument("--material_stage_domain_points", type=int, default=1024)
     return parser.parse_args()
@@ -157,18 +169,44 @@ def split_iterations(total_iterations, num_chunks):
     return [base + (1 if idx < remainder else 0) for idx in range(num_chunks) if base + (1 if idx < remainder else 0) > 0]
 
 
+def linear_schedule_value(start, end, alpha):
+    return float(start) + (float(end) - float(start)) * float(alpha)
+
+
 def initialize_geometry_parameters(args, net):
     if getattr(args, "layer_y_init", -1.0) > 0 and hasattr(net, "raw_layer_y"):
         raw_value = bounded_logit(args.layer_y_init, 0.15, 0.85)
         net.raw_layer_y.data.fill_(raw_value)
 
 
-def save_stage_loss_artifacts(losshistory, save_dir, stage_name):
+def save_stage_loss_artifacts(losshistory, save_dir, stage_name, args=None):
     if losshistory is None:
         return
     save_loss_history_json(losshistory, save_dir, filename=f"{stage_name}_loss_history.json")
     save_best_test_loss_json(losshistory, save_dir, filename=f"{stage_name}_best_test_loss.json")
     save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
+    if args is not None:
+        num_pde = len(pde_loss_names(args.reg_weight, args.method))
+        plot_and_save_loss_history(
+            losshistory,
+            save_dir,
+            filename=f"{stage_name}_loss_history.png",
+            num_pde_losses=num_pde,
+            num_bc_losses=4,
+            pde_label="Physics Loss",
+            bc_label="Boundary + Observation Loss",
+            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            data_loss_prefix="obs_",
+        )
+        plot_all_loss_components(
+            losshistory,
+            save_dir,
+            filename=f"{stage_name}_loss_components.png",
+            num_pde_losses=num_pde,
+            num_bc_losses=4,
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
+            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+        )
 
 
 def extract_material_stage_points(data, geom, seed, fallback_count, max_points=None):
@@ -594,24 +632,49 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     schedule_rows = []
     losshistory = None
     train_state = None
-    start = float(args.main_correction_scale_start)
-    end = float(args.main_correction_scale_end)
+    correction_start = float(args.main_correction_scale_start)
+    correction_end = float(args.main_correction_scale_end)
+    physics_start = float(args.main_stage_physics_scale_start)
+    physics_end = float(args.main_stage_physics_scale_end)
+    reg_start = float(args.main_stage_reg_scale_start)
+    reg_end = float(args.main_stage_reg_scale_end)
+    data_start = float(args.main_stage_data_scale_start)
+    data_end = float(args.main_stage_data_scale_end)
+    boundary_start = float(args.main_stage_boundary_scale_start)
+    boundary_end = float(args.main_stage_boundary_scale_end)
+    lr_start = float(args.main_stage_lr_start if args.main_stage_lr_start > 0 else args.main_lr)
+    lr_end = float(args.main_stage_lr_end if args.main_stage_lr_end > 0 else lr_start)
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
         if len(chunk_sizes) == 1:
             alpha = 1.0
         else:
             alpha = float(chunk_idx - 1) / float(len(chunk_sizes) - 1)
-        correction_scale = start + (end - start) * alpha
+        correction_scale = linear_schedule_value(correction_start, correction_end, alpha)
+        physics_scale = linear_schedule_value(physics_start, physics_end, alpha)
+        reg_scale = linear_schedule_value(reg_start, reg_end, alpha)
+        data_scale = linear_schedule_value(data_start, data_end, alpha)
+        boundary_scale = linear_schedule_value(boundary_start, boundary_end, alpha)
+        lr = linear_schedule_value(lr_start, lr_end, alpha)
         set_correction_stage_scale(net, correction_scale)
-        model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
+        model.compile(
+            "adam",
+            lr=lr,
+            loss_weights=resolve_loss_weights(
+                args,
+                physics_scale=physics_scale,
+                reg_scale=reg_scale,
+                data_scale=data_scale,
+                boundary_scale=boundary_scale,
+            ),
+        )
         callbacks = make_callbacks(args, save_dir, metadata)
         losshistory, train_state = model.train(
             iterations=chunk_iterations,
             display_every=max(100, min(args.display_every, chunk_iterations)),
             callbacks=callbacks,
         )
-        save_stage_loss_artifacts(losshistory, save_dir, f"main_chunk_{chunk_idx}")
+        save_stage_loss_artifacts(losshistory, save_dir, f"main_chunk_{chunk_idx}", args=args)
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
@@ -619,22 +682,37 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
             {
                 "chunk": int(chunk_idx),
                 "chunk_iterations": int(chunk_iterations),
+                "lr": float(lr),
                 "correction_scale": float(correction_scale),
+                "physics_scale": float(physics_scale),
+                "reg_scale": float(reg_scale),
+                "data_scale": float(data_scale),
+                "boundary_scale": float(boundary_scale),
                 "validation_observation_mse": float(val_mse),
             }
         )
 
     payload = {
-        "stage_name": "main_correction_schedule",
+        "stage_name": "main_stage_schedule",
         "main_iterations": int(main_iterations),
         "main_lr": float(args.main_lr),
-        "scale_start": float(args.main_correction_scale_start),
-        "scale_end": float(args.main_correction_scale_end),
+        "lr_start": float(lr_start),
+        "lr_end": float(lr_end),
+        "correction_scale_start": float(correction_start),
+        "correction_scale_end": float(correction_end),
+        "physics_scale_start": float(physics_start),
+        "physics_scale_end": float(physics_end),
+        "reg_scale_start": float(reg_start),
+        "reg_scale_end": float(reg_end),
+        "data_scale_start": float(data_start),
+        "data_scale_end": float(data_end),
+        "boundary_scale_start": float(boundary_start),
+        "boundary_scale_end": float(boundary_end),
         "chunks": int(args.main_correction_chunks),
         "history": schedule_rows,
     }
-    save_json(os.path.join(save_dir, "json", "main_correction_schedule.json"), payload)
-    save_text(os.path.join(save_dir, "txt", "main_correction_schedule.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
+    save_json(os.path.join(save_dir, "json", "main_stage_schedule.json"), payload)
+    save_text(os.path.join(save_dir, "txt", "main_stage_schedule.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
     return losshistory, train_state
 
 
@@ -675,7 +753,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             display_every=max(100, min(args.display_every, chunk_iterations)),
             callbacks=callbacks,
         )
-        save_stage_loss_artifacts(losshistory, save_dir, f"adaptive_main_chunk_{chunk_idx}")
+        save_stage_loss_artifacts(losshistory, save_dir, f"adaptive_main_chunk_{chunk_idx}", args=args)
 
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
@@ -792,7 +870,7 @@ def main():
                 display_every=max(100, min(args.display_every, warmup_iterations)),
                 callbacks=[],
             )
-            save_stage_loss_artifacts(warmup_history, args.save_dir, "warmup")
+            save_stage_loss_artifacts(warmup_history, args.save_dir, "warmup", args=args)
             save_json(
                 os.path.join(args.save_dir, "json", "stage_training_plan.json"),
                 {
@@ -856,6 +934,16 @@ def main():
                     "main_correction_scale_start": args.main_correction_scale_start,
                     "main_correction_scale_end": args.main_correction_scale_end,
                     "main_correction_chunks": args.main_correction_chunks,
+                    "main_stage_physics_scale_start": args.main_stage_physics_scale_start,
+                    "main_stage_physics_scale_end": args.main_stage_physics_scale_end,
+                    "main_stage_reg_scale_start": args.main_stage_reg_scale_start,
+                    "main_stage_reg_scale_end": args.main_stage_reg_scale_end,
+                    "main_stage_data_scale_start": args.main_stage_data_scale_start,
+                    "main_stage_data_scale_end": args.main_stage_data_scale_end,
+                    "main_stage_boundary_scale_start": args.main_stage_boundary_scale_start,
+                    "main_stage_boundary_scale_end": args.main_stage_boundary_scale_end,
+                    "main_stage_lr_start": args.main_stage_lr_start,
+                    "main_stage_lr_end": args.main_stage_lr_end,
                     "geometry_stage_domain_points": args.geometry_stage_domain_points,
                     "material_stage_domain_points": args.material_stage_domain_points,
                 },
@@ -896,7 +984,7 @@ def main():
             )
         losshistory = main_history
         if refinement_stage_iterations > 0:
-            save_stage_loss_artifacts(main_history, args.save_dir, 'main')
+            save_stage_loss_artifacts(main_history, args.save_dir, 'main', args=args)
             if args.freeze_geometry_refinement:
                 set_geometry_branch_trainable(net, False)
                 set_region_parameter_trainable(net, True)
@@ -916,7 +1004,7 @@ def main():
                 display_every=max(100, min(args.display_every, refinement_stage_iterations)),
                 callbacks=refinement_callbacks,
             )
-            save_stage_loss_artifacts(refinement_history, args.save_dir, 'refinement')
+            save_stage_loss_artifacts(refinement_history, args.save_dir, 'refinement', args=args)
             losshistory = refinement_history
             if args.freeze_geometry_refinement:
                 set_geometry_branch_trainable(net, True)
