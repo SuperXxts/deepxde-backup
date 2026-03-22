@@ -257,7 +257,7 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     for key, value in diagnostics.items():
         if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
             continue
-        if key in {"delta_lambda", "delta_mu", "coarse_lambda", "coarse_mu", "correction_gate"}:
+        if key in {"delta_lambda", "delta_mu", "coarse_lambda", "coarse_mu", "correction_gate", "active_correction_scale"}:
             continue
         geometry_values[key] = value
     if "delta_lambda" in diagnostics and "delta_mu" in diagnostics:
