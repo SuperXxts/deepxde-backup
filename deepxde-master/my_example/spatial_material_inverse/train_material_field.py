@@ -90,6 +90,9 @@ def parse_args():
     parser.add_argument("--adaptive_main_data_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_boundary_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_domain_points", type=int, default=2048)
+    parser.add_argument("--main_correction_scale_start", type=float, default=1.0)
+    parser.add_argument("--main_correction_scale_end", type=float, default=1.0)
+    parser.add_argument("--main_correction_chunks", type=int, default=1)
     return parser.parse_args()
 
 
@@ -119,9 +122,15 @@ def set_region_parameter_trainable(net, trainable):
 
 
 def set_residual_branch_trainable(net, trainable):
+    residual_prefixes = ("residual_net.", "lambda_residual_net.", "mu_residual_net.")
     for name, parameter in net.named_parameters():
-        if name.startswith("residual_net."):
+        if name.startswith(residual_prefixes):
             parameter.requires_grad = bool(trainable)
+
+
+def set_correction_stage_scale(net, scale):
+    if hasattr(net, "active_correction_scale"):
+        net.active_correction_scale = float(scale)
 
 
 def mean_squared_error(prediction, target):
@@ -295,7 +304,12 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, not state_frozen)
     set_material_branch_trainable(net, True)
-    if hasattr(net, "residual_net"):
+    if hasattr(net, "active_correction_scale"):
+        correction_scale_before_stage = float(net.active_correction_scale)
+        set_correction_stage_scale(net, 0.0)
+    else:
+        correction_scale_before_stage = None
+    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
         set_residual_branch_trainable(net, False)
     if region_frozen:
         set_region_parameter_trainable(net, False)
@@ -385,7 +399,9 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, True)
     set_region_parameter_trainable(net, True)
-    if hasattr(net, "residual_net"):
+    if correction_scale_before_stage is not None:
+        set_correction_stage_scale(net, correction_scale_before_stage)
+    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
         set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
@@ -433,7 +449,12 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
     set_material_branch_trainable(net, True)
-    if hasattr(net, "residual_net"):
+    if hasattr(net, "active_correction_scale"):
+        correction_scale_before_stage = float(net.active_correction_scale)
+        set_correction_stage_scale(net, 0.0)
+    else:
+        correction_scale_before_stage = None
+    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
         set_residual_branch_trainable(net, False)
     if args.freeze_geometry_material_stage:
         set_geometry_branch_trainable(net, False)
@@ -518,7 +539,9 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         set_requires_grad(net.state_net, True)
     set_geometry_branch_trainable(net, True)
     set_region_parameter_trainable(net, True)
-    if hasattr(net, "residual_net"):
+    if correction_scale_before_stage is not None:
+        set_correction_stage_scale(net, correction_scale_before_stage)
+    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
         set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
@@ -544,6 +567,61 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     save_json(os.path.join(save_dir, "json", "material_stage_history.json"), history_payload)
     save_text(os.path.join(save_dir, "txt", "material_stage_history.txt"), json.dumps(history_payload, indent=2, ensure_ascii=False))
     return history_payload
+
+
+def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir, main_iterations):
+    if main_iterations <= 0:
+        return None, None
+
+    chunk_sizes = split_iterations(main_iterations, args.main_correction_chunks)
+    if not chunk_sizes:
+        return None, None
+
+    schedule_rows = []
+    losshistory = None
+    train_state = None
+    start = float(args.main_correction_scale_start)
+    end = float(args.main_correction_scale_end)
+
+    for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
+        if len(chunk_sizes) == 1:
+            alpha = 1.0
+        else:
+            alpha = float(chunk_idx - 1) / float(len(chunk_sizes) - 1)
+        correction_scale = start + (end - start) * alpha
+        set_correction_stage_scale(net, correction_scale)
+        model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
+        callbacks = make_callbacks(args, save_dir, metadata)
+        losshistory, train_state = model.train(
+            iterations=chunk_iterations,
+            display_every=max(100, min(args.display_every, chunk_iterations)),
+            callbacks=callbacks,
+        )
+        save_stage_loss_artifacts(losshistory, save_dir, f"main_chunk_{chunk_idx}")
+        val_mse = compute_observation_mse(
+            model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
+        )
+        schedule_rows.append(
+            {
+                "chunk": int(chunk_idx),
+                "chunk_iterations": int(chunk_iterations),
+                "correction_scale": float(correction_scale),
+                "validation_observation_mse": float(val_mse),
+            }
+        )
+
+    payload = {
+        "stage_name": "main_correction_schedule",
+        "main_iterations": int(main_iterations),
+        "main_lr": float(args.main_lr),
+        "scale_start": float(args.main_correction_scale_start),
+        "scale_end": float(args.main_correction_scale_end),
+        "chunks": int(args.main_correction_chunks),
+        "history": schedule_rows,
+    }
+    save_json(os.path.join(save_dir, "json", "main_correction_schedule.json"), payload)
+    save_text(os.path.join(save_dir, "txt", "main_correction_schedule.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
+    return losshistory, train_state
 
 
 def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata, save_dir, main_iterations):
@@ -761,6 +839,9 @@ def main():
                     "adaptive_main_reg_scale": args.adaptive_main_reg_scale,
                     "adaptive_main_data_scale": args.adaptive_main_data_scale,
                     "adaptive_main_boundary_scale": args.adaptive_main_boundary_scale,
+                    "main_correction_scale_start": args.main_correction_scale_start,
+                    "main_correction_scale_end": args.main_correction_scale_end,
+                    "main_correction_chunks": args.main_correction_chunks,
                 },
             )
             set_material_branch_trainable(net, True)
@@ -789,12 +870,13 @@ def main():
                 main_iterations=main_iterations,
             )
         else:
-            model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
-            callbacks = make_callbacks(args, args.save_dir, metadata)
-            main_history, train_state = model.train(
-                iterations=max(main_iterations, 1),
-                display_every=args.display_every,
-                callbacks=callbacks,
+            main_history, train_state = run_main_stage_with_correction_schedule(
+                args=args,
+                model=model,
+                net=net,
+                metadata=metadata,
+                save_dir=args.save_dir,
+                main_iterations=max(main_iterations, 1),
             )
         losshistory = main_history
         if refinement_stage_iterations > 0:

@@ -727,6 +727,43 @@ def normalized_gate_from_probs(class_probs, mode="none"):
     raise ValueError(f"Unsupported correction_gate_mode: {mode}")
 
 
+def interface_locality_gate(interface_indicator, class_probs, scale=1.0, power=1.0):
+    if class_probs.shape[1] == 2:
+        phase_probability = class_probs[:, 1:2]
+        locality = 4.0 * phase_probability * (1.0 - phase_probability)
+    else:
+        locality = normalized_gate_from_probs(class_probs, mode="uncertainty")
+    locality = torch.clamp(float(scale) * locality, 0.0, 1.0)
+    if float(power) != 1.0:
+        locality = locality ** float(power)
+    return locality
+
+
+def build_correction_gate(interface_indicator, class_probs, mode="uncertainty", locality_scale=1.0, locality_power=1.0):
+    if mode == "none":
+        return torch.ones((class_probs.shape[0], 1), dtype=class_probs.dtype, device=class_probs.device)
+    if mode == "uncertainty":
+        return normalized_gate_from_probs(class_probs, mode="uncertainty")
+    if mode == "entropy":
+        return normalized_gate_from_probs(class_probs, mode="entropy")
+
+    interface_gate = interface_locality_gate(
+        interface_indicator,
+        class_probs,
+        scale=locality_scale,
+        power=locality_power,
+    )
+    if mode == "interface":
+        return interface_gate
+    if mode == "interface_uncertainty":
+        uncertainty_gate = normalized_gate_from_probs(class_probs, mode="uncertainty")
+        return torch.clamp(interface_gate * uncertainty_gate, 0.0, 1.0)
+    if mode == "interface_entropy":
+        entropy_gate = normalized_gate_from_probs(class_probs, mode="entropy")
+        return torch.clamp(interface_gate * entropy_gate, 0.0, 1.0)
+    raise ValueError(f"Unsupported correction_gate_mode: {mode}")
+
+
 class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
     def __init__(
         self,
@@ -743,6 +780,9 @@ class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
         correction_gate_mode="uncertainty",
         correction_lambda_scale=0.25,
         correction_mu_scale=0.25,
+        correction_locality_scale=1.0,
+        correction_locality_power=1.0,
+        split_residual_heads=False,
         backbone_type="mlp",
     ):
         super().__init__(
@@ -759,16 +799,36 @@ class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
         self.correction_gate_mode = correction_gate_mode
         self.correction_lambda_scale = float(correction_lambda_scale)
         self.correction_mu_scale = float(correction_mu_scale)
+        self.correction_locality_scale = float(correction_locality_scale)
+        self.correction_locality_power = float(correction_locality_power)
+        self.split_residual_heads = bool(split_residual_heads)
+        self.active_correction_scale = 1.0
         self.residual_features = FourierFeatureMap(
             residual_num_frequencies if residual_num_frequencies > 0 else num_frequencies
         )
-        self.residual_net = build_backbone(
-            input_dim=self.residual_features.output_dim,
-            hidden_layers=residual_hidden_layers,
-            output_dim=2,
-            activation=activation,
-            backbone_type=backbone_type,
-        )
+        if self.split_residual_heads:
+            self.lambda_residual_net = build_backbone(
+                input_dim=self.residual_features.output_dim,
+                hidden_layers=residual_hidden_layers,
+                output_dim=1,
+                activation=activation,
+                backbone_type=backbone_type,
+            )
+            self.mu_residual_net = build_backbone(
+                input_dim=self.residual_features.output_dim,
+                hidden_layers=residual_hidden_layers,
+                output_dim=1,
+                activation=activation,
+                backbone_type=backbone_type,
+            )
+        else:
+            self.residual_net = build_backbone(
+                input_dim=self.residual_features.output_dim,
+                hidden_layers=residual_hidden_layers,
+                output_dim=2,
+                activation=activation,
+                backbone_type=backbone_type,
+            )
 
     def _material_from_inputs(self, inputs):
         interface_indicator, class_probs, geometry = self._geometry_logits(inputs)
@@ -778,19 +838,28 @@ class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
         coarse_mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
 
         residual_features = self.residual_features(inputs)
-        raw_delta = self.residual_net(residual_features)
-        correction_gate = normalized_gate_from_probs(class_probs, mode=self.correction_gate_mode)
-        delta_lambda_raw = torch.tanh(raw_delta[:, 0:1])
-        delta_mu_raw = torch.tanh(raw_delta[:, 1:2])
+        if self.split_residual_heads:
+            delta_lambda_raw = torch.tanh(self.lambda_residual_net(residual_features))
+            delta_mu_raw = torch.tanh(self.mu_residual_net(residual_features))
+        else:
+            raw_delta = self.residual_net(residual_features)
+            delta_lambda_raw = torch.tanh(raw_delta[:, 0:1])
+            delta_mu_raw = torch.tanh(raw_delta[:, 1:2])
+        correction_gate = build_correction_gate(
+            interface_indicator,
+            class_probs,
+            mode=self.correction_gate_mode,
+            locality_scale=self.correction_locality_scale,
+            locality_power=self.correction_locality_power,
+        )
+        active_scale = float(getattr(self, "active_correction_scale", 1.0))
+        delta_lambda = active_scale * self.correction_lambda_scale * correction_gate * delta_lambda_raw
+        delta_mu = active_scale * self.correction_mu_scale * correction_gate * delta_mu_raw
 
         if self.correction_mode == "additive":
-            delta_lambda = self.correction_lambda_scale * correction_gate * delta_lambda_raw
-            delta_mu = self.correction_mu_scale * correction_gate * delta_mu_raw
             lmbd = torch.clamp(coarse_lambda + delta_lambda, min=self.lambda_floor)
             mu = torch.clamp(coarse_mu + delta_mu, min=self.mu_floor)
         elif self.correction_mode == "multiplicative":
-            delta_lambda = self.correction_lambda_scale * correction_gate * delta_lambda_raw
-            delta_mu = self.correction_mu_scale * correction_gate * delta_mu_raw
             lmbd = torch.clamp(coarse_lambda * (1.0 + delta_lambda), min=self.lambda_floor)
             mu = torch.clamp(coarse_mu * (1.0 + delta_mu), min=self.mu_floor)
         else:
@@ -802,6 +871,7 @@ class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
             "delta_lambda": delta_lambda,
             "delta_mu": delta_mu,
             "correction_gate": correction_gate,
+            "active_correction_scale": torch.full_like(coarse_lambda, active_scale),
         }
 
     def forward(self, inputs):
@@ -879,6 +949,9 @@ def build_network(args):
             correction_gate_mode=args.correction_gate_mode,
             correction_lambda_scale=args.correction_lambda_scale,
             correction_mu_scale=args.correction_mu_scale,
+            correction_locality_scale=args.correction_locality_scale,
+            correction_locality_power=args.correction_locality_power,
+            split_residual_heads=args.split_residual_heads,
             backbone_type=args.backbone_type,
         )
     elif args.method == "geoiaminn":
@@ -1923,9 +1996,12 @@ def build_common_parser(description):
     parser.add_argument("--num_frequencies", type=int, default=4)
     parser.add_argument("--residual_num_frequencies", type=int, default=0)
     parser.add_argument("--correction_mode", choices=["additive", "multiplicative"], default="multiplicative")
-    parser.add_argument("--correction_gate_mode", choices=["none", "uncertainty", "entropy"], default="uncertainty")
+    parser.add_argument("--correction_gate_mode", choices=["none", "uncertainty", "entropy", "interface", "interface_uncertainty", "interface_entropy"], default="uncertainty")
     parser.add_argument("--correction_lambda_scale", type=float, default=0.25)
     parser.add_argument("--correction_mu_scale", type=float, default=0.25)
+    parser.add_argument("--correction_locality_scale", type=float, default=1.0)
+    parser.add_argument("--correction_locality_power", type=float, default=1.0)
+    parser.add_argument("--split_residual_heads", action="store_true")
     parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
     parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
