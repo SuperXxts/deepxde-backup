@@ -52,13 +52,6 @@ from .checkpoint_utils import (
     load_best_weights
 )
 
-from .benchmark_plot_utils import (
-    default_benchmark_images_root,
-    generate_method_comparison,
-    generate_paper_images,
-    generate_pinn_vs_iaminn_v1_architecture,
-)
-
 __all__ = [
     "save_model_config",
     "save_loss_history",
@@ -89,8 +82,4 @@ __all__ = [
     "create_best_model_checkpoint",
     "save_last_weights",
     "load_best_weights",
-    "default_benchmark_images_root",
-    "generate_method_comparison",
-    "generate_paper_images",
-    "generate_pinn_vs_iaminn_v1_architecture",
 ]

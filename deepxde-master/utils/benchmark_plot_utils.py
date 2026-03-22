@@ -1,5 +1,4 @@
 ﻿import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -14,10 +13,6 @@ UTILS_DIR = Path(__file__).resolve().parent
 DEEPXDE_ROOT = UTILS_DIR.parent
 REPO_ROOT = DEEPXDE_ROOT.parent
 SPATIAL_DIR = DEEPXDE_ROOT / "my_example" / "spatial_material_inverse"
-if str(SPATIAL_DIR) not in sys.path:
-    sys.path.append(str(SPATIAL_DIR))
-
-from shared import exact_state_numpy, get_case_config, make_grid
 
 BLUE = "#355F94"
 GOLD = "#D2A071"
@@ -26,6 +21,14 @@ PALE = "#EEF3F8"
 PALE2 = "#F7F3EC"
 GREEN = "#3C7A5A"
 RED = "#A94F4F"
+
+
+def _load_spatial_shared_symbols():
+    if str(SPATIAL_DIR) not in sys.path:
+        sys.path.append(str(SPATIAL_DIR))
+    from shared import exact_state_numpy, get_case_config, make_grid
+
+    return exact_state_numpy, get_case_config, make_grid
 
 
 def ensure_dir(path):
@@ -183,6 +186,7 @@ def generate_method_comparison(case_name, baseline_name, method_name, baseline_d
 
 def plot_case_definition(case_name, output_dir):
     output_dir = ensure_dir(output_dir)
+    exact_state_numpy, get_case_config, make_grid = _load_spatial_shared_symbols()
     case_config = get_case_config(case_name)
     points, xx, yy = make_grid(200, 200)
     truth = exact_state_numpy(points, case_config)
