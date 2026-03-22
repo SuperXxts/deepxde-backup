@@ -1,5 +1,7 @@
+import argparse
 import json
 import os
+from pathlib import Path
 
 from shared import (
     build_common_parser,
@@ -17,8 +19,23 @@ def parse_args():
     return parser.parse_args()
 
 
+def restore_args_from_run_config(cli_args):
+    run_config_path = Path(cli_args.save_dir) / "json" / "run_config.json"
+    if not run_config_path.exists():
+        return cli_args
+
+    with open(run_config_path, "r", encoding="utf-8") as f:
+        run_config = json.load(f)
+
+    restored = argparse.Namespace(**run_config["args"])
+    restored.save_dir = cli_args.save_dir
+    restored.model_path = cli_args.model_path
+    restored.checkpoint_preference = cli_args.checkpoint_preference
+    return restored
+
+
 def main():
-    args = parse_args()
+    args = restore_args_from_run_config(parse_args())
     case_config = prepare_run(args)
     _, data, metadata = build_data(args, case_config)
     model, _ = build_model(args, data)
