@@ -78,6 +78,18 @@ def parse_args():
     parser.add_argument('--refinement_stage_boundary_scale', type=float, default=1.0)
     parser.add_argument('--freeze_geometry_refinement', action='store_true')
     parser.add_argument('--refinement_stage_interface_sharpness', type=float, default=-1.0)
+    parser.add_argument("--adaptive_main_stage", action="store_true")
+    parser.add_argument("--adaptive_main_chunks", type=int, default=4)
+    parser.add_argument("--adaptive_main_base_physics_scale", type=float, default=1.0)
+    parser.add_argument("--adaptive_main_min_physics_scale", type=float, default=0.25)
+    parser.add_argument("--adaptive_main_max_physics_scale", type=float, default=4.0)
+    parser.add_argument("--adaptive_main_scale_up", type=float, default=1.35)
+    parser.add_argument("--adaptive_main_scale_down", type=float, default=0.75)
+    parser.add_argument("--adaptive_main_obs_guard", type=float, default=1.15)
+    parser.add_argument("--adaptive_main_reg_scale", type=float, default=1.0)
+    parser.add_argument("--adaptive_main_data_scale", type=float, default=1.0)
+    parser.add_argument("--adaptive_main_boundary_scale", type=float, default=1.0)
+    parser.add_argument("--adaptive_main_domain_points", type=int, default=2048)
     return parser.parse_args()
 
 
@@ -116,6 +128,16 @@ def bounded_logit(target, lower, upper):
     clipped = min(max(float(target), lower + 1e-6), upper - 1e-6)
     normalized = (clipped - lower) / (upper - lower)
     return float(np.log(normalized / (1.0 - normalized)))
+
+
+def split_iterations(total_iterations, num_chunks):
+    total_iterations = max(int(total_iterations), 0)
+    if total_iterations <= 0:
+        return []
+    num_chunks = max(1, min(int(num_chunks), total_iterations))
+    base = total_iterations // num_chunks
+    remainder = total_iterations % num_chunks
+    return [base + (1 if idx < remainder else 0) for idx in range(num_chunks) if base + (1 if idx < remainder else 0) > 0]
 
 
 def initialize_geometry_parameters(args, net):
@@ -496,6 +518,122 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     return history_payload
 
 
+def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata, save_dir, main_iterations):
+    if not args.adaptive_main_stage or not is_compact_material_method(args.method) or main_iterations <= 0:
+        return None, None
+
+    stage_points = extract_material_stage_points(
+        data=data,
+        geom=geom,
+        seed=args.seed + 801,
+        fallback_count=max(args.num_domain, args.adaptive_main_domain_points),
+    )
+    if len(stage_points) > args.adaptive_main_domain_points:
+        stage_points = stage_points[: args.adaptive_main_domain_points]
+    np.savez(os.path.join(save_dir, "npz", "adaptive_main_stage_points.npz"), points=stage_points)
+    save_array_txt(os.path.join(save_dir, "txt", "adaptive_main_stage_points.txt"), stage_points, "x y")
+
+    chunk_sizes = split_iterations(main_iterations, args.adaptive_main_chunks)
+    physics_scale = float(args.adaptive_main_base_physics_scale)
+    best_val = float("inf")
+    history_rows = []
+    losshistory = None
+    train_state = None
+
+    for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
+        weights = resolve_loss_weights(
+            args,
+            physics_scale=physics_scale,
+            reg_scale=args.adaptive_main_reg_scale,
+            boundary_scale=args.adaptive_main_boundary_scale,
+            data_scale=args.adaptive_main_data_scale,
+        )
+        model.compile("adam", lr=args.main_lr, loss_weights=weights)
+        callbacks = make_callbacks(args, save_dir, metadata)
+        losshistory, train_state = model.train(
+            iterations=chunk_iterations,
+            display_every=max(100, min(args.display_every, chunk_iterations)),
+            callbacks=callbacks,
+        )
+        save_stage_loss_artifacts(losshistory, save_dir, f"adaptive_main_chunk_{chunk_idx}")
+
+        val_mse = compute_observation_mse(
+            model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
+        )
+        terms = compute_compact_material_stage_terms(
+            net=net,
+            domain_points=stage_points,
+            case_config=case_config,
+            reg_weight=args.reg_weight,
+            usage_floor=args.material_stage_usage_floor,
+            args=args,
+        )
+        physics_mse = float(terms["physics_mse"].detach().cpu().item())
+        reg_mse = float(terms["reg_mse"].detach().cpu().item())
+
+        if val_mse < best_val:
+            best_val = val_mse
+            next_physics_scale = min(float(args.adaptive_main_max_physics_scale), physics_scale * float(args.adaptive_main_scale_up))
+            update_reason = "improved_validation"
+        elif val_mse <= best_val * float(args.adaptive_main_obs_guard):
+            next_physics_scale = min(
+                float(args.adaptive_main_max_physics_scale),
+                physics_scale * (1.0 + 0.5 * (float(args.adaptive_main_scale_up) - 1.0)),
+            )
+            update_reason = "within_guard"
+        else:
+            next_physics_scale = max(float(args.adaptive_main_min_physics_scale), physics_scale * float(args.adaptive_main_scale_down))
+            update_reason = "validation_regression"
+
+        row = {
+            "chunk": int(chunk_idx),
+            "chunk_iterations": int(chunk_iterations),
+            "physics_scale_before": float(physics_scale),
+            "physics_scale_after": float(next_physics_scale),
+            "validation_selection_mse": float(val_mse),
+            "best_validation_selection_mse": float(best_val),
+            "physics_mse": physics_mse,
+            "reg_mse": reg_mse,
+            "mean_class_probs": [float(v) for v in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
+            "lambda_regions": [float(v) for v in terms["lambda_regions"].detach().cpu().numpy().tolist()],
+            "mu_regions": [float(v) for v in terms["mu_regions"].detach().cpu().numpy().tolist()],
+            "update_reason": update_reason,
+        }
+        for key, value in terms["geometry_values"].items():
+            row[key] = float(value.detach().cpu().item())
+        history_rows.append(row)
+        print(
+            "[adaptive_main] chunk={} iters={} val={:.4e} physics_mse={:.4e} scale={:.4f}->{:.4f} reason={}".format(
+                row["chunk"],
+                row["chunk_iterations"],
+                row["validation_selection_mse"],
+                row["physics_mse"],
+                row["physics_scale_before"],
+                row["physics_scale_after"],
+                row["update_reason"],
+            )
+        )
+        physics_scale = next_physics_scale
+
+    payload = {
+        "stage_name": "adaptive_main_stage",
+        "chunks": history_rows,
+        "base_physics_scale": float(args.adaptive_main_base_physics_scale),
+        "min_physics_scale": float(args.adaptive_main_min_physics_scale),
+        "max_physics_scale": float(args.adaptive_main_max_physics_scale),
+        "scale_up": float(args.adaptive_main_scale_up),
+        "scale_down": float(args.adaptive_main_scale_down),
+        "obs_guard": float(args.adaptive_main_obs_guard),
+        "reg_scale": float(args.adaptive_main_reg_scale),
+        "data_scale": float(args.adaptive_main_data_scale),
+        "boundary_scale": float(args.adaptive_main_boundary_scale),
+        "domain_points": int(len(stage_points)),
+    }
+    save_json(os.path.join(save_dir, "json", "adaptive_main_stage_history.json"), payload)
+    save_text(os.path.join(save_dir, "txt", "adaptive_main_stage_history.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
+    return losshistory, train_state
+
+
 def main():
     args = parse_args()
     case_config = prepare_run(args)
@@ -584,6 +722,17 @@ def main():
                     "refinement_stage_boundary_scale": args.refinement_stage_boundary_scale,
                     "freeze_geometry_refinement": args.freeze_geometry_refinement,
                     "refinement_stage_interface_sharpness": args.refinement_stage_interface_sharpness,
+                    "adaptive_main_stage": args.adaptive_main_stage,
+                    "adaptive_main_chunks": args.adaptive_main_chunks,
+                    "adaptive_main_base_physics_scale": args.adaptive_main_base_physics_scale,
+                    "adaptive_main_min_physics_scale": args.adaptive_main_min_physics_scale,
+                    "adaptive_main_max_physics_scale": args.adaptive_main_max_physics_scale,
+                    "adaptive_main_scale_up": args.adaptive_main_scale_up,
+                    "adaptive_main_scale_down": args.adaptive_main_scale_down,
+                    "adaptive_main_obs_guard": args.adaptive_main_obs_guard,
+                    "adaptive_main_reg_scale": args.adaptive_main_reg_scale,
+                    "adaptive_main_data_scale": args.adaptive_main_data_scale,
+                    "adaptive_main_boundary_scale": args.adaptive_main_boundary_scale,
                 },
             )
             set_material_branch_trainable(net, True)
@@ -599,13 +748,26 @@ def main():
         original_sharpness = getattr(net, 'interface_sharpness', None)
         if hasattr(net, 'interface_sharpness') and args.main_stage_interface_sharpness > 0:
             net.interface_sharpness = float(args.main_stage_interface_sharpness)
-        model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
-        callbacks = make_callbacks(args, args.save_dir, metadata)
-        main_history, train_state = model.train(
-            iterations=max(main_iterations, 1),
-            display_every=args.display_every,
-            callbacks=callbacks,
-        )
+        if args.adaptive_main_stage and main_iterations > 0:
+            main_history, train_state = run_adaptive_main_stage(
+                args=args,
+                model=model,
+                net=net,
+                geom=geom,
+                data=data,
+                case_config=case_config,
+                metadata=metadata,
+                save_dir=args.save_dir,
+                main_iterations=main_iterations,
+            )
+        else:
+            model.compile("adam", lr=args.main_lr, loss_weights=resolve_loss_weights(args))
+            callbacks = make_callbacks(args, args.save_dir, metadata)
+            main_history, train_state = model.train(
+                iterations=max(main_iterations, 1),
+                display_every=args.display_every,
+                callbacks=callbacks,
+            )
         losshistory = main_history
         if refinement_stage_iterations > 0:
             save_stage_loss_artifacts(main_history, args.save_dir, 'main')

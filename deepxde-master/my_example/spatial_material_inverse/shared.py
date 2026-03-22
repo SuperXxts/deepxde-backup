@@ -415,15 +415,76 @@ class SimpleMLP(nn.Module):
         return self.net(x)
 
 
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim, activation="tanh"):
+        super().__init__()
+        activation_cls = activation_factory(activation)
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = activation_cls()
+        nn.init.xavier_uniform_(self.linear1.weight)
+        nn.init.zeros_(self.linear1.bias)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x):
+        residual = x
+        x = self.activation(self.linear1(x))
+        x = self.linear2(x)
+        return self.activation(x + residual)
+
+
+class ResidualMLP(nn.Module):
+    def __init__(self, input_dim, hidden_layers, output_dim, activation="tanh"):
+        super().__init__()
+        if not hidden_layers:
+            raise ValueError("ResidualMLP requires at least one hidden layer.")
+        activation_cls = activation_factory(activation)
+        self.input_layer = nn.Linear(input_dim, hidden_layers[0])
+        nn.init.xavier_uniform_(self.input_layer.weight)
+        nn.init.zeros_(self.input_layer.bias)
+        self.input_activation = activation_cls()
+        stages = []
+        current_dim = hidden_layers[0]
+        for hidden_dim in hidden_layers:
+            if current_dim != hidden_dim:
+                projection = nn.Linear(current_dim, hidden_dim)
+                nn.init.xavier_uniform_(projection.weight)
+                nn.init.zeros_(projection.bias)
+                stages.append(nn.Sequential(projection, activation_cls()))
+                current_dim = hidden_dim
+            stages.append(ResidualBlock(current_dim, activation=activation))
+        self.stages = nn.ModuleList(stages)
+        self.output_layer = nn.Linear(current_dim, output_dim)
+        nn.init.xavier_uniform_(self.output_layer.weight)
+        nn.init.zeros_(self.output_layer.bias)
+
+    def forward(self, x):
+        x = self.input_activation(self.input_layer(x))
+        for stage in self.stages:
+            x = stage(x)
+        return self.output_layer(x)
+
+
+def build_backbone(input_dim, hidden_layers, output_dim, activation="tanh", backbone_type="mlp"):
+    backbone_type = backbone_type.lower()
+    if backbone_type == "mlp":
+        return SimpleMLP(input_dim, hidden_layers, output_dim, activation=activation)
+    if backbone_type == "resmlp":
+        return ResidualMLP(input_dim, hidden_layers, output_dim, activation=activation)
+    raise ValueError(f"Unsupported backbone_type: {backbone_type}")
+
+
 class VanillaMaterialFieldNet(dde.nn.pytorch.nn.NN):
-    def __init__(self, hidden_layers, activation="tanh", num_frequencies=0):
+    def __init__(self, hidden_layers, activation="tanh", num_frequencies=0, backbone_type="mlp"):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
-        self.backbone = SimpleMLP(
+        self.backbone = build_backbone(
             input_dim=self.features.output_dim,
             hidden_layers=hidden_layers,
             output_dim=len(FIELD_NAMES),
             activation=activation,
+            backbone_type=backbone_type,
         )
 
     def forward(self, inputs):
@@ -456,6 +517,7 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         lambda_floor=0.1,
         mu_floor=0.1,
         interface_sharpness=10.0,
+        backbone_type="mlp",
     ):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
@@ -465,17 +527,19 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         self.mu_floor = float(mu_floor)
         self.interface_sharpness = float(interface_sharpness)
         feature_dim = self.features.output_dim
-        self.state_net = SimpleMLP(
+        self.state_net = build_backbone(
             input_dim=feature_dim,
             hidden_layers=state_hidden_layers,
             output_dim=2,
             activation=activation,
+            backbone_type=backbone_type,
         )
-        self.interface_net = SimpleMLP(
+        self.interface_net = build_backbone(
             input_dim=feature_dim,
             hidden_layers=interface_hidden_layers,
             output_dim=self.num_regions,
             activation=activation,
+            backbone_type=backbone_type,
         )
         lambda_init = torch.linspace(-0.35, 0.35, steps=self.num_regions + 1, dtype=torch.float32)
         mu_init = torch.linspace(-0.2, 0.2, steps=self.num_regions + 1, dtype=torch.float32)
@@ -539,6 +603,7 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         lambda_floor=0.1,
         mu_floor=0.1,
         interface_sharpness=40.0,
+        backbone_type="mlp",
     ):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
@@ -547,11 +612,12 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         self.lambda_floor = float(lambda_floor)
         self.mu_floor = float(mu_floor)
         self.interface_sharpness = float(interface_sharpness)
-        self.state_net = SimpleMLP(
+        self.state_net = build_backbone(
             input_dim=self.features.output_dim,
             hidden_layers=state_hidden_layers,
             output_dim=2,
             activation=activation,
+            backbone_type=backbone_type,
         )
         lambda_init = torch.linspace(-0.35, 0.35, steps=self.num_regions + 1, dtype=torch.float32)
         mu_init = torch.linspace(-0.2, 0.2, steps=self.num_regions + 1, dtype=torch.float32)
@@ -680,6 +746,7 @@ def build_network(args):
             lambda_floor=args.lambda_floor,
             mu_floor=args.mu_floor,
             interface_sharpness=args.interface_sharpness,
+            backbone_type=args.backbone_type,
         )
     elif args.method == "geoiaminn":
         net = GeometryAwareMaterialNet(
@@ -690,12 +757,14 @@ def build_network(args):
             lambda_floor=args.lambda_floor,
             mu_floor=args.mu_floor,
             interface_sharpness=args.interface_sharpness,
+            backbone_type=args.backbone_type,
         )
     else:
         net = VanillaMaterialFieldNet(
             hidden_layers=parse_hidden_layers(args.hidden_layers),
             activation=args.activation,
             num_frequencies=args.num_frequencies,
+            backbone_type=args.backbone_type,
         )
         net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method))
     return net
@@ -1711,6 +1780,7 @@ def build_common_parser(description):
     parser.add_argument("--lambda_floor", type=float, default=0.1)
     parser.add_argument("--mu_floor", type=float, default=0.1)
     parser.add_argument("--activation", type=str, default="tanh")
+    parser.add_argument("--backbone_type", choices=["mlp", "resmlp"], default="mlp")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
     parser.add_argument("--state_layers", type=str, default="128,128,128,128")
     parser.add_argument("--interface_layers", type=str, default="128,128,128,128")
