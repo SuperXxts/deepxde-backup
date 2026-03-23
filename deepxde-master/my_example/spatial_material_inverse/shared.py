@@ -1574,13 +1574,36 @@ def _manual_fourier_features(x, num_frequencies):
     return torch.cat(features, dim=1)
 
 
+def _infer_feature_dimension_from_state_net(net):
+    state_net = getattr(net, "state_net", None)
+    if state_net is None:
+        return None
+    modules = getattr(state_net, "net", state_net)
+    if isinstance(modules, nn.Module):
+        modules = list(modules.modules())
+    for module in modules:
+        if isinstance(module, nn.Linear):
+            return int(module.in_features)
+    return None
+
+
+def _make_state_features_for_prediction(net, x):
+    state_inputs = x
+    if getattr(net, "_input_transform", None) is not None:
+        state_inputs = net._input_transform(x)
+    feature_module = getattr(net, "features", None)
+    features = feature_module(state_inputs) if callable(feature_module) else state_inputs
+    expected_dim = _infer_feature_dimension_from_state_net(net)
+    if expected_dim is not None and features.shape[1] != expected_dim and state_inputs.shape[1] == 2:
+        if expected_dim >= 2 and (expected_dim - 2) % 4 == 0:
+            inferred_num_frequencies = (expected_dim - 2) // 4
+            features = _manual_fourier_features(state_inputs, inferred_num_frequencies)
+    return features
+
+
 def _forward_compact_raw_tensor(net, x, args):
-    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net") and hasattr(net, "features"):
-        state_inputs = x
-        if getattr(net, "_input_transform", None) is not None:
-            state_inputs = net._input_transform(x)
-        num_frequencies = getattr(getattr(net, "features", None), "num_frequencies", 0)
-        features = _manual_fourier_features(state_inputs, num_frequencies)
+    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net"):
+        features = _make_state_features_for_prediction(net, x)
         state_outputs = net.state_net(features)
         if hasattr(net, "_material_from_features"):
             lmbd, mu, _, _, _ = net._material_from_features(features)
