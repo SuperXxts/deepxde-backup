@@ -1679,8 +1679,12 @@ class ValidationObservationCheckpoint(dde.callbacks.Callback):
         super().__init__()
         self.filepath = filepath
         self.save_dir = save_dir
-        self.observation_points = np.asarray(observation_points, dtype=float)
-        self.observation_truth_clean = np.asarray(observation_truth_clean, dtype=float)
+        if isinstance(observation_points, (list, tuple)):
+            self.observation_points = [np.asarray(points, dtype=float) for points in observation_points]
+            self.observation_truth_clean = [np.asarray(values, dtype=float) for values in observation_truth_clean]
+        else:
+            self.observation_points = np.asarray(observation_points, dtype=float)
+            self.observation_truth_clean = np.asarray(observation_truth_clean, dtype=float)
         self.args = args
         self.period = period
         self.verbose = verbose
