@@ -9,6 +9,9 @@ from shared import (
     build_common_parser,
     build_data,
     build_model,
+    compact_material_indices,
+    compact_num_loads,
+    compact_state_indices,
     compute_observation_mse,
     count_trainable_parameters,
     evaluate_model,
@@ -29,6 +32,7 @@ from shared import (
     save_training_artifacts,
     plot_all_loss_components,
     plot_and_save_loss_history,
+    parse_load_scales,
 )
 
 
@@ -92,9 +96,7 @@ def parse_args():
     parser.add_argument("--adaptive_main_data_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_boundary_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_domain_points", type=int, default=2048)
-    parser.add_argument("--main_correction_scale_start", type=float, default=1.0)
-    parser.add_argument("--main_correction_scale_end", type=float, default=1.0)
-    parser.add_argument("--main_correction_chunks", type=int, default=1)
+    parser.add_argument("--main_stage_chunks", type=int, default=1)
     parser.add_argument("--main_stage_physics_scale_start", type=float, default=1.0)
     parser.add_argument("--main_stage_physics_scale_end", type=float, default=1.0)
     parser.add_argument("--main_stage_reg_scale_start", type=float, default=1.0)
@@ -135,18 +137,6 @@ def set_region_parameter_trainable(net, trainable):
             parameter.requires_grad = bool(trainable)
 
 
-def set_residual_branch_trainable(net, trainable):
-    residual_prefixes = ("residual_net.", "lambda_residual_net.", "mu_residual_net.")
-    for name, parameter in net.named_parameters():
-        if name.startswith(residual_prefixes):
-            parameter.requires_grad = bool(trainable)
-
-
-def set_correction_stage_scale(net, scale):
-    if hasattr(net, "active_correction_scale"):
-        net.active_correction_scale = float(scale)
-
-
 def mean_squared_error(prediction, target):
     if prediction.numel() == 0:
         return torch.zeros((), dtype=prediction.dtype, device=prediction.device)
@@ -157,6 +147,31 @@ def bounded_logit(target, lower, upper):
     clipped = min(max(float(target), lower + 1e-6), upper - 1e-6)
     normalized = (clipped - lower) / (upper - lower)
     return float(np.log(normalized / (1.0 - normalized)))
+
+
+def average_multiload_fit_losses(net, metadata, args, device, target_kind="noisy"):
+    load_count = compact_num_loads(args)
+    data_terms = []
+    boundary_terms = []
+    train_payloads = metadata.get("train_observation_loads", [metadata["train_observation"]])
+    boundary_payloads = metadata.get("boundary_observation_loads", [metadata["boundary_observation"]])
+    for load_index in range(load_count):
+        ux_idx, uy_idx = compact_state_indices(args, load_index)
+        train_payload = train_payloads[load_index]
+        boundary_payload = boundary_payloads[load_index]
+        observation_points_t = torch.tensor(train_payload["points"], dtype=torch.float32, device=device)
+        observation_values_t = torch.tensor(train_payload[target_kind], dtype=torch.float32, device=device)
+        boundary_points_t = torch.tensor(boundary_payload["points"], dtype=torch.float32, device=device)
+        boundary_values_t = torch.tensor(boundary_payload["clean"], dtype=torch.float32, device=device)
+        observation_prediction = net(observation_points_t)[:, [ux_idx, uy_idx]]
+        boundary_prediction = net(boundary_points_t)[:, [ux_idx, uy_idx]]
+        data_terms.append(mean_squared_error(observation_prediction, observation_values_t))
+        boundary_terms.append(mean_squared_error(boundary_prediction, boundary_values_t))
+    data_mse = torch.mean(torch.stack(data_terms)) if data_terms else torch.zeros((), dtype=torch.float32, device=device)
+    boundary_mse = (
+        torch.mean(torch.stack(boundary_terms)) if boundary_terms else torch.zeros((), dtype=torch.float32, device=device)
+    )
+    return data_mse, boundary_mse
 
 
 def split_iterations(total_iterations, num_chunks):
@@ -186,16 +201,25 @@ def save_stage_loss_artifacts(losshistory, save_dir, stage_name, args=None):
     save_best_test_loss_json(losshistory, save_dir, filename=f"{stage_name}_best_test_loss.json")
     save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
     if args is not None:
-        num_pde = len(pde_loss_names(args.reg_weight, args.method))
+        num_pde = len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")))
         plot_and_save_loss_history(
             losshistory,
             save_dir,
             filename=f"{stage_name}_loss_history.png",
             num_pde_losses=num_pde,
-            num_bc_losses=4,
+            num_bc_losses=4 * compact_num_loads(args),
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
-            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            bc_loss_names=[
+                label
+                for load_index in range(compact_num_loads(args))
+                for label in (
+                    f"boundary_ux_l{load_index}",
+                    f"boundary_uy_l{load_index}",
+                    f"obs_ux_l{load_index}",
+                    f"obs_uy_l{load_index}",
+                )
+            ],
             data_loss_prefix="obs_",
         )
         plot_all_loss_components(
@@ -203,9 +227,18 @@ def save_stage_loss_artifacts(losshistory, save_dir, stage_name, args=None):
             save_dir,
             filename=f"{stage_name}_loss_components.png",
             num_pde_losses=num_pde,
-            num_bc_losses=4,
-            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
-            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            num_bc_losses=4 * compact_num_loads(args),
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+            bc_loss_names=[
+                label
+                for load_index in range(compact_num_loads(args))
+                for label in (
+                    f"boundary_ux_l{load_index}",
+                    f"boundary_uy_l{load_index}",
+                    f"obs_ux_l{load_index}",
+                    f"obs_uy_l{load_index}",
+                )
+            ],
         )
 
 
@@ -240,27 +273,31 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     device = next(net.parameters()).device
     x = torch.tensor(domain_points, dtype=torch.float32, device=device, requires_grad=True)
     raw = net(x)
-    ux = raw[:, 0:1]
-    uy = raw[:, 1:2]
-    lmbd = raw[:, 2:3]
-    mu = raw[:, 3:4]
-
-    ux_grad = torch.autograd.grad(ux, x, grad_outputs=torch.ones_like(ux), create_graph=True, retain_graph=True)[0]
-    uy_grad = torch.autograd.grad(uy, x, grad_outputs=torch.ones_like(uy), create_graph=True, retain_graph=True)[0]
-    exx = ux_grad[:, 0:1]
-    eyy = uy_grad[:, 1:2]
-    exy = 0.5 * (ux_grad[:, 1:2] + uy_grad[:, 0:1])
-
-    sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
-    syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
-    sxy = 2.0 * mu * exy
-
-    sxx_grad = torch.autograd.grad(sxx, x, grad_outputs=torch.ones_like(sxx), create_graph=True, retain_graph=True)[0]
-    syy_grad = torch.autograd.grad(syy, x, grad_outputs=torch.ones_like(syy), create_graph=True, retain_graph=True)[0]
-    sxy_grad = torch.autograd.grad(sxy, x, grad_outputs=torch.ones_like(sxy), create_graph=True, retain_graph=True)[0]
-    fx, fy = exact_body_force_torch(x, case_config)
-    momentum_x = sxx_grad[:, 0:1] + sxy_grad[:, 1:2] + fx
-    momentum_y = sxy_grad[:, 0:1] + syy_grad[:, 1:2] + fy
+    lambda_idx, mu_idx = compact_material_indices(args)
+    lmbd = raw[:, lambda_idx:lambda_idx + 1]
+    mu = raw[:, mu_idx:mu_idx + 1]
+    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
+    physics_mse = torch.zeros((), dtype=torch.float32, device=device)
+    for load_index, load_scale in enumerate(load_scales):
+        ux_idx, uy_idx = compact_state_indices(args, load_index)
+        ux = raw[:, ux_idx:ux_idx + 1]
+        uy = raw[:, uy_idx:uy_idx + 1]
+        ux_grad = torch.autograd.grad(ux, x, grad_outputs=torch.ones_like(ux), create_graph=True, retain_graph=True)[0]
+        uy_grad = torch.autograd.grad(uy, x, grad_outputs=torch.ones_like(uy), create_graph=True, retain_graph=True)[0]
+        exx = ux_grad[:, 0:1]
+        eyy = uy_grad[:, 1:2]
+        exy = 0.5 * (ux_grad[:, 1:2] + uy_grad[:, 0:1])
+        sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+        syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+        sxy = 2.0 * mu * exy
+        sxx_grad = torch.autograd.grad(sxx, x, grad_outputs=torch.ones_like(sxx), create_graph=True, retain_graph=True)[0]
+        syy_grad = torch.autograd.grad(syy, x, grad_outputs=torch.ones_like(syy), create_graph=True, retain_graph=True)[0]
+        sxy_grad = torch.autograd.grad(sxy, x, grad_outputs=torch.ones_like(sxy), create_graph=True, retain_graph=True)[0]
+        fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale)
+        momentum_x = sxx_grad[:, 0:1] + sxy_grad[:, 1:2] + fx
+        momentum_y = sxy_grad[:, 0:1] + syy_grad[:, 1:2] + fy
+        physics_mse = physics_mse + torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
+    physics_mse = physics_mse / float(max(len(load_scales), 1))
 
     lambda_grad = torch.autograd.grad(lmbd, x, grad_outputs=torch.ones_like(lmbd), create_graph=True, retain_graph=True)[0]
     mu_grad = torch.autograd.grad(mu, x, grad_outputs=torch.ones_like(mu), create_graph=True, retain_graph=True)[0]
@@ -290,19 +327,12 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     physics_mse = torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
     geometry_prior = torch.zeros((), dtype=torch.float32, device=device)
     geometry_values = {}
-    correction_penalty = torch.zeros((), dtype=torch.float32, device=device)
-    correction_gate_mean = torch.zeros((), dtype=torch.float32, device=device)
     for key, value in diagnostics.items():
         if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
             continue
-        if key in {"delta_lambda", "delta_mu", "coarse_lambda", "coarse_mu", "correction_gate", "active_correction_scale"}:
-            continue
-        geometry_values[key] = value
-    if "delta_lambda" in diagnostics and "delta_mu" in diagnostics:
-        correction_penalty = torch.mean(diagnostics["delta_lambda"] ** 2 + diagnostics["delta_mu"] ** 2)
-    if "correction_gate" in diagnostics:
-        correction_gate_mean = torch.mean(diagnostics["correction_gate"])
-    if hasattr(net, "case_name") and net.case_name == "layered" and "layer_y" in geometry_values:
+        if torch.is_tensor(value) and value.numel() == 1:
+            geometry_values[key] = value
+    if hasattr(net, "case_name") and getattr(net, "case_name", None) == "layered" and "layer_y" in geometry_values:
         target = torch.tensor(float(args.layer_y_prior_target), dtype=torch.float32, device=device)
         geometry_prior = torch.mean((geometry_values["layer_y"] - target) ** 2)
 
@@ -312,8 +342,6 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
         "usage_penalty": usage_penalty,
         "binary_penalty": binary_penalty,
         "geometry_prior": geometry_prior,
-        "correction_penalty": correction_penalty,
-        "correction_gate_mean": correction_gate_mean,
         "mean_class_probs": mean_probs,
         "lambda_regions": diagnostics["lambda_regions"],
         "mu_regions": diagnostics["mu_regions"],
@@ -340,28 +368,11 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     save_array_txt(os.path.join(save_dir, "txt", "geometry_stage_points.txt"), stage_points, "x y")
 
     device = next(net.parameters()).device
-    observation_points = np.asarray(metadata["train_observation"]["points"], dtype=float)
-    observation_values = np.asarray(metadata["train_observation"]["noisy"], dtype=float)
-    boundary_points = np.asarray(metadata["boundary_observation"]["points"], dtype=float)
-    boundary_values = np.asarray(metadata["boundary_observation"]["clean"], dtype=float)
-
-    observation_points_t = torch.tensor(observation_points, dtype=torch.float32, device=device)
-    observation_values_t = torch.tensor(observation_values, dtype=torch.float32, device=device)
-    boundary_points_t = torch.tensor(boundary_points, dtype=torch.float32, device=device)
-    boundary_values_t = torch.tensor(boundary_values, dtype=torch.float32, device=device)
-
     state_frozen = bool(args.freeze_state_geometry_stage)
     region_frozen = bool(args.freeze_region_geometry_stage)
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, not state_frozen)
     set_material_branch_trainable(net, True)
-    if hasattr(net, "active_correction_scale"):
-        correction_scale_before_stage = float(net.active_correction_scale)
-        set_correction_stage_scale(net, 0.0)
-    else:
-        correction_scale_before_stage = None
-    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
-        set_residual_branch_trainable(net, False)
     if region_frozen:
         set_region_parameter_trainable(net, False)
     set_geometry_branch_trainable(net, True)
@@ -387,10 +398,7 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
             args=args,
         )
 
-        observation_prediction = net(observation_points_t)[:, :2]
-        boundary_prediction = net(boundary_points_t)[:, :2]
-        data_mse = mean_squared_error(observation_prediction, observation_values_t)
-        boundary_mse = mean_squared_error(boundary_prediction, boundary_values_t)
+        data_mse, boundary_mse = average_multiload_fit_losses(net, metadata, args, device, target_kind="noisy")
 
         if terms["mean_class_probs"].numel() >= 2:
             balance_penalty = torch.mean(
@@ -421,8 +429,6 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
             "balance_penalty": float(balance_penalty.detach().cpu().item()),
             "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
-            "correction_penalty": float(terms["correction_penalty"].detach().cpu().item()),
-            "correction_gate_mean": float(terms["correction_gate_mean"].detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -450,10 +456,6 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     if hasattr(net, "state_net"):
         set_requires_grad(net.state_net, True)
     set_region_parameter_trainable(net, True)
-    if correction_scale_before_stage is not None:
-        set_correction_stage_scale(net, correction_scale_before_stage)
-    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
-        set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
 
@@ -501,13 +503,6 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
     set_material_branch_trainable(net, True)
-    if hasattr(net, "active_correction_scale"):
-        correction_scale_before_stage = float(net.active_correction_scale)
-        set_correction_stage_scale(net, 0.0)
-    else:
-        correction_scale_before_stage = None
-    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
-        set_residual_branch_trainable(net, False)
     if args.freeze_geometry_material_stage:
         set_geometry_branch_trainable(net, False)
         set_region_parameter_trainable(net, True)
@@ -561,8 +556,6 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             "binary_penalty": float(terms["binary_penalty"].detach().cpu().item()),
             "geometry_prior": float(terms["geometry_prior"].detach().cpu().item()),
             "contrast_penalty": float(contrast_penalty.detach().cpu().item()),
-            "correction_penalty": float(terms["correction_penalty"].detach().cpu().item()),
-            "correction_gate_mean": float(terms["correction_gate_mean"].detach().cpu().item()),
             "mean_class_probs": [float(value) for value in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -591,10 +584,6 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         set_requires_grad(net.state_net, True)
     set_geometry_branch_trainable(net, True)
     set_region_parameter_trainable(net, True)
-    if correction_scale_before_stage is not None:
-        set_correction_stage_scale(net, correction_scale_before_stage)
-    if hasattr(net, "residual_net") or hasattr(net, "lambda_residual_net"):
-        set_residual_branch_trainable(net, True)
     if original_sharpness is not None:
         net.interface_sharpness = float(original_sharpness)
 
@@ -625,15 +614,13 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     if main_iterations <= 0:
         return None, None
 
-    chunk_sizes = split_iterations(main_iterations, args.main_correction_chunks)
+    chunk_sizes = split_iterations(main_iterations, args.main_stage_chunks)
     if not chunk_sizes:
         return None, None
 
     schedule_rows = []
     losshistory = None
     train_state = None
-    correction_start = float(args.main_correction_scale_start)
-    correction_end = float(args.main_correction_scale_end)
     physics_start = float(args.main_stage_physics_scale_start)
     physics_end = float(args.main_stage_physics_scale_end)
     reg_start = float(args.main_stage_reg_scale_start)
@@ -650,13 +637,11 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
             alpha = 1.0
         else:
             alpha = float(chunk_idx - 1) / float(len(chunk_sizes) - 1)
-        correction_scale = linear_schedule_value(correction_start, correction_end, alpha)
         physics_scale = linear_schedule_value(physics_start, physics_end, alpha)
         reg_scale = linear_schedule_value(reg_start, reg_end, alpha)
         data_scale = linear_schedule_value(data_start, data_end, alpha)
         boundary_scale = linear_schedule_value(boundary_start, boundary_end, alpha)
         lr = linear_schedule_value(lr_start, lr_end, alpha)
-        set_correction_stage_scale(net, correction_scale)
         model.compile(
             "adam",
             lr=lr,
@@ -683,7 +668,6 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
                 "chunk": int(chunk_idx),
                 "chunk_iterations": int(chunk_iterations),
                 "lr": float(lr),
-                "correction_scale": float(correction_scale),
                 "physics_scale": float(physics_scale),
                 "reg_scale": float(reg_scale),
                 "data_scale": float(data_scale),
@@ -698,8 +682,6 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
         "main_lr": float(args.main_lr),
         "lr_start": float(lr_start),
         "lr_end": float(lr_end),
-        "correction_scale_start": float(correction_start),
-        "correction_scale_end": float(correction_end),
         "physics_scale_start": float(physics_start),
         "physics_scale_end": float(physics_end),
         "reg_scale_start": float(reg_start),
@@ -708,7 +690,7 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
         "data_scale_end": float(data_end),
         "boundary_scale_start": float(boundary_start),
         "boundary_scale_end": float(boundary_end),
-        "chunks": int(args.main_correction_chunks),
+        "chunks": int(args.main_stage_chunks),
         "history": schedule_rows,
     }
     save_json(os.path.join(save_dir, "json", "main_stage_schedule.json"), payload)
@@ -931,9 +913,6 @@ def main():
                     "adaptive_main_reg_scale": args.adaptive_main_reg_scale,
                     "adaptive_main_data_scale": args.adaptive_main_data_scale,
                     "adaptive_main_boundary_scale": args.adaptive_main_boundary_scale,
-                    "main_correction_scale_start": args.main_correction_scale_start,
-                    "main_correction_scale_end": args.main_correction_scale_end,
-                    "main_correction_chunks": args.main_correction_chunks,
                     "main_stage_physics_scale_start": args.main_stage_physics_scale_start,
                     "main_stage_physics_scale_end": args.main_stage_physics_scale_end,
                     "main_stage_reg_scale_start": args.main_stage_reg_scale_start,
@@ -944,8 +923,12 @@ def main():
                     "main_stage_boundary_scale_end": args.main_stage_boundary_scale_end,
                     "main_stage_lr_start": args.main_stage_lr_start,
                     "main_stage_lr_end": args.main_stage_lr_end,
+                    "main_stage_chunks": args.main_stage_chunks,
                     "geometry_stage_domain_points": args.geometry_stage_domain_points,
                     "material_stage_domain_points": args.material_stage_domain_points,
+                    "load_scales": args.load_scales,
+                    "primary_load_index": args.primary_load_index,
+                    "material_parameterization": getattr(args, "material_parameterization", "lamemu"),
                 },
             )
             set_material_branch_trainable(net, True)
@@ -1036,9 +1019,11 @@ def main():
         "noise_level": args.noise_level,
         "boundary_weight": args.boundary_weight,
         "observation_split_tag": args.observation_split_tag,
-        "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
+        "pde_loss_names": pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
         "selection_metric": "validation_observation_mse",
         "staged_training": bool(args.staged_training and is_compact_material_method(args.method)),
+        "load_scales": getattr(args, "load_scales", "1.0"),
+        "primary_load_index": int(getattr(args, "primary_load_index", 0)),
     }
 
     if args.run_eval_after_train:

@@ -105,6 +105,42 @@ def parse_hidden_layers(value):
     return [int(v.strip()) for v in str(value).split(",") if v.strip()]
 
 
+def parse_load_scales(value):
+    if isinstance(value, (list, tuple)):
+        scales = [float(v) for v in value]
+    else:
+        scales = [float(v.strip()) for v in str(value).split(",") if v.strip()]
+    if not scales:
+        raise ValueError("At least one load scale is required.")
+    return scales
+
+
+def compact_num_loads(args_or_method, load_scales=None):
+    if hasattr(args_or_method, "method"):
+        method = args_or_method.method
+        load_scale_value = getattr(args_or_method, "load_scales", "1.0")
+    else:
+        method = str(args_or_method)
+        load_scale_value = load_scales if load_scales is not None else "1.0"
+    if method == "geoiaminn_v3":
+        return len(parse_load_scales(load_scale_value))
+    return 1
+
+
+def compact_material_indices(args):
+    num_loads = compact_num_loads(args)
+    if args.method == "geoiaminn_v3":
+        return 2 * num_loads, 2 * num_loads + 1
+    return 2, 3
+
+
+def compact_state_indices(args, load_index=0):
+    if args.method == "geoiaminn_v3":
+        start = 2 * int(load_index)
+        return start, start + 1
+    return 0, 1
+
+
 def smooth_step_numpy(value):
     return 0.5 * (1.0 + np.tanh(value))
 
@@ -195,29 +231,29 @@ def exact_material_torch(x, case_config):
     return lmbd, mu
 
 
-def exact_displacement_numpy(points, case_config):
+def exact_displacement_numpy(points, case_config, load_scale=1.0):
     x = points[:, 0:1]
     y = points[:, 1:2]
-    ux = case_config.amplitude_u * np.sin(PI * x) * np.sin(PI * y)
-    uy = case_config.amplitude_v * np.sin(2.0 * PI * x) * np.sin(PI * y)
+    ux = load_scale * case_config.amplitude_u * np.sin(PI * x) * np.sin(PI * y)
+    uy = load_scale * case_config.amplitude_v * np.sin(2.0 * PI * x) * np.sin(PI * y)
     return ux, uy
 
 
-def exact_strain_numpy(points, case_config):
+def exact_strain_numpy(points, case_config, load_scale=1.0):
     x = points[:, 0:1]
     y = points[:, 1:2]
-    exx = case_config.amplitude_u * PI * np.cos(PI * x) * np.sin(PI * y)
-    eyy = case_config.amplitude_v * PI * np.sin(2.0 * PI * x) * np.cos(PI * y)
+    exx = load_scale * case_config.amplitude_u * PI * np.cos(PI * x) * np.sin(PI * y)
+    eyy = load_scale * case_config.amplitude_v * PI * np.sin(2.0 * PI * x) * np.cos(PI * y)
     exy = 0.5 * (
-        case_config.amplitude_u * PI * np.sin(PI * x) * np.cos(PI * y)
-        + case_config.amplitude_v * 2.0 * PI * np.cos(2.0 * PI * x) * np.sin(PI * y)
+        load_scale * case_config.amplitude_u * PI * np.sin(PI * x) * np.cos(PI * y)
+        + load_scale * case_config.amplitude_v * 2.0 * PI * np.cos(2.0 * PI * x) * np.sin(PI * y)
     )
     return exx, eyy, exy
 
 
-def exact_state_numpy(points, case_config):
-    ux, uy = exact_displacement_numpy(points, case_config)
-    exx, eyy, exy = exact_strain_numpy(points, case_config)
+def exact_state_numpy(points, case_config, load_scale=1.0):
+    ux, uy = exact_displacement_numpy(points, case_config, load_scale=load_scale)
+    exx, eyy, exy = exact_strain_numpy(points, case_config, load_scale=load_scale)
     lmbd, mu = exact_material_numpy(points, case_config)
     trace = exx + eyy
     sxx = lmbd * trace + 2.0 * mu * exx
@@ -226,16 +262,16 @@ def exact_state_numpy(points, case_config):
     return np.hstack((ux, uy, sxx, syy, sxy, lmbd, mu))
 
 
-def exact_state_torch(x, case_config):
+def exact_state_torch(x, case_config, load_scale=1.0):
     px = x[:, 0:1]
     py = x[:, 1:2]
-    ux = case_config.amplitude_u * torch.sin(PI * px) * torch.sin(PI * py)
-    uy = case_config.amplitude_v * torch.sin(2.0 * PI * px) * torch.sin(PI * py)
-    exx = case_config.amplitude_u * PI * torch.cos(PI * px) * torch.sin(PI * py)
-    eyy = case_config.amplitude_v * PI * torch.sin(2.0 * PI * px) * torch.cos(PI * py)
+    ux = load_scale * case_config.amplitude_u * torch.sin(PI * px) * torch.sin(PI * py)
+    uy = load_scale * case_config.amplitude_v * torch.sin(2.0 * PI * px) * torch.sin(PI * py)
+    exx = load_scale * case_config.amplitude_u * PI * torch.cos(PI * px) * torch.sin(PI * py)
+    eyy = load_scale * case_config.amplitude_v * PI * torch.sin(2.0 * PI * px) * torch.cos(PI * py)
     exy = 0.5 * (
-        case_config.amplitude_u * PI * torch.sin(PI * px) * torch.cos(PI * py)
-        + case_config.amplitude_v * 2.0 * PI * torch.cos(2.0 * PI * px) * torch.sin(PI * py)
+        load_scale * case_config.amplitude_u * PI * torch.sin(PI * px) * torch.cos(PI * py)
+        + load_scale * case_config.amplitude_v * 2.0 * PI * torch.cos(2.0 * PI * px) * torch.sin(PI * py)
     )
     lmbd, mu = exact_material_torch(x, case_config)
     trace = exx + eyy
@@ -245,8 +281,8 @@ def exact_state_torch(x, case_config):
     return torch.cat((ux, uy, sxx, syy, sxy, lmbd, mu), dim=1)
 
 
-def exact_body_force_torch(x, case_config):
-    exact_state = exact_state_torch(x, case_config)
+def exact_body_force_torch(x, case_config, load_scale=1.0):
+    exact_state = exact_state_torch(x, case_config, load_scale=load_scale)
     sxx_x = dde.grad.jacobian(exact_state, x, i=2, j=0)
     sxy_y = dde.grad.jacobian(exact_state, x, i=4, j=1)
     sxy_x = dde.grad.jacobian(exact_state, x, i=4, j=0)
@@ -713,166 +749,81 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         return diagnostics
 
 
-def normalized_gate_from_probs(class_probs, mode="none"):
-    if mode == "none":
-        return torch.ones((class_probs.shape[0], 1), dtype=class_probs.dtype, device=class_probs.device)
-    if mode == "uncertainty":
-        max_prob, _ = torch.max(class_probs, dim=1, keepdim=True)
-        denom = max(1.0 - 1.0 / float(class_probs.shape[1]), 1e-6)
-        return torch.clamp((1.0 - max_prob) / denom, 0.0, 1.0)
-    if mode == "entropy":
-        entropy = -torch.sum(class_probs * torch.log(class_probs.clamp_min(1e-8)), dim=1, keepdim=True)
-        max_entropy = math.log(float(class_probs.shape[1]))
-        return torch.clamp(entropy / max(max_entropy, 1e-6), 0.0, 1.0)
-    raise ValueError(f"Unsupported correction_gate_mode: {mode}")
-
-
-def interface_locality_gate(interface_indicator, class_probs, scale=1.0, power=1.0):
-    if class_probs.shape[1] == 2:
-        phase_probability = class_probs[:, 1:2]
-        locality = 4.0 * phase_probability * (1.0 - phase_probability)
-    else:
-        locality = normalized_gate_from_probs(class_probs, mode="uncertainty")
-    locality = torch.clamp(float(scale) * locality, 0.0, 1.0)
-    if float(power) != 1.0:
-        locality = locality ** float(power)
-    return locality
-
-
-def build_correction_gate(interface_indicator, class_probs, mode="uncertainty", locality_scale=1.0, locality_power=1.0):
-    if mode == "none":
-        return torch.ones((class_probs.shape[0], 1), dtype=class_probs.dtype, device=class_probs.device)
-    if mode == "uncertainty":
-        return normalized_gate_from_probs(class_probs, mode="uncertainty")
-    if mode == "entropy":
-        return normalized_gate_from_probs(class_probs, mode="entropy")
-
-    interface_gate = interface_locality_gate(
-        interface_indicator,
-        class_probs,
-        scale=locality_scale,
-        power=locality_power,
-    )
-    if mode == "interface":
-        return interface_gate
-    if mode == "interface_uncertainty":
-        uncertainty_gate = normalized_gate_from_probs(class_probs, mode="uncertainty")
-        return torch.clamp(interface_gate * uncertainty_gate, 0.0, 1.0)
-    if mode == "interface_entropy":
-        entropy_gate = normalized_gate_from_probs(class_probs, mode="entropy")
-        return torch.clamp(interface_gate * entropy_gate, 0.0, 1.0)
-    raise ValueError(f"Unsupported correction_gate_mode: {mode}")
-
-
-class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
+class SmoothGeometryAwareMaterialNetV3(dde.nn.pytorch.nn.NN):
     def __init__(
         self,
-        case_name,
+        num_loads,
         state_hidden_layers,
-        residual_hidden_layers,
+        geometry_hidden_layers,
         activation="tanh",
         num_frequencies=0,
-        residual_num_frequencies=0,
         lambda_floor=0.1,
         mu_floor=0.1,
-        interface_sharpness=40.0,
-        correction_mode="multiplicative",
-        correction_gate_mode="uncertainty",
-        correction_lambda_scale=0.25,
-        correction_mu_scale=0.25,
-        correction_locality_scale=1.0,
-        correction_locality_power=1.0,
-        split_residual_heads=False,
+        k_floor=0.2,
+        interface_sharpness=12.0,
+        parameterization="bulkmu",
         backbone_type="mlp",
     ):
-        super().__init__(
-            case_name=case_name,
-            state_hidden_layers=state_hidden_layers,
+        super().__init__()
+        self.num_loads = int(num_loads)
+        self.num_regions = 1
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.k_floor = float(k_floor)
+        self.interface_sharpness = float(interface_sharpness)
+        self.parameterization = str(parameterization)
+        self.features = FourierFeatureMap(num_frequencies)
+        feature_dim = self.features.output_dim
+        self.state_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=state_hidden_layers,
+            output_dim=2 * self.num_loads,
             activation=activation,
-            num_frequencies=num_frequencies,
-            lambda_floor=lambda_floor,
-            mu_floor=mu_floor,
-            interface_sharpness=interface_sharpness,
             backbone_type=backbone_type,
         )
-        self.correction_mode = correction_mode
-        self.correction_gate_mode = correction_gate_mode
-        self.correction_lambda_scale = float(correction_lambda_scale)
-        self.correction_mu_scale = float(correction_mu_scale)
-        self.correction_locality_scale = float(correction_locality_scale)
-        self.correction_locality_power = float(correction_locality_power)
-        self.split_residual_heads = bool(split_residual_heads)
-        self.active_correction_scale = 1.0
-        self.residual_features = FourierFeatureMap(
-            residual_num_frequencies if residual_num_frequencies > 0 else num_frequencies
+        self.geometry_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=geometry_hidden_layers,
+            output_dim=1,
+            activation=activation,
+            backbone_type=backbone_type,
         )
-        if self.split_residual_heads:
-            self.lambda_residual_net = build_backbone(
-                input_dim=self.residual_features.output_dim,
-                hidden_layers=residual_hidden_layers,
-                output_dim=1,
-                activation=activation,
-                backbone_type=backbone_type,
-            )
-            self.mu_residual_net = build_backbone(
-                input_dim=self.residual_features.output_dim,
-                hidden_layers=residual_hidden_layers,
-                output_dim=1,
-                activation=activation,
-                backbone_type=backbone_type,
-            )
+        if self.parameterization == "bulkmu":
+            self.raw_k_params = nn.Parameter(torch.tensor([-0.15, 0.35], dtype=torch.float32))
+            self.raw_mu_params = nn.Parameter(torch.tensor([-0.05, 0.2], dtype=torch.float32))
+        elif self.parameterization == "lamemu":
+            self.raw_lambda_params = nn.Parameter(torch.tensor([-0.15, 0.35], dtype=torch.float32))
+            self.raw_mu_params = nn.Parameter(torch.tensor([-0.05, 0.2], dtype=torch.float32))
         else:
-            self.residual_net = build_backbone(
-                input_dim=self.residual_features.output_dim,
-                hidden_layers=residual_hidden_layers,
-                output_dim=2,
-                activation=activation,
-                backbone_type=backbone_type,
-            )
+            raise ValueError(f"Unsupported material parameterization: {self.parameterization}")
 
-    def _material_from_inputs(self, inputs):
-        interface_indicator, class_probs, geometry = self._geometry_logits(inputs)
-        lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
-        mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
-        coarse_lambda = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
-        coarse_mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
-
-        residual_features = self.residual_features(inputs)
-        if self.split_residual_heads:
-            delta_lambda_raw = torch.tanh(self.lambda_residual_net(residual_features))
-            delta_mu_raw = torch.tanh(self.mu_residual_net(residual_features))
+    def _material_from_features(self, features):
+        phase_logits = self.geometry_net(features)
+        phase_probability = torch.sigmoid(self.interface_sharpness * phase_logits)
+        class_probs = torch.cat((1.0 - phase_probability, phase_probability), dim=1)
+        if self.parameterization == "bulkmu":
+            bulk_regions = self.k_floor + F.softplus(self.raw_k_params)
+            mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+            bulk = torch.sum(class_probs * bulk_regions.unsqueeze(0), dim=1, keepdim=True)
+            mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+            lmbd = torch.clamp(bulk - (2.0 / 3.0) * mu, min=self.lambda_floor)
+            lambda_regions = torch.clamp(bulk_regions - (2.0 / 3.0) * mu_regions, min=self.lambda_floor)
+            aux = {
+                "bulk": bulk,
+                "bulk_regions": bulk_regions,
+                "lambda_regions": lambda_regions,
+                "mu_regions": mu_regions,
+            }
         else:
-            raw_delta = self.residual_net(residual_features)
-            delta_lambda_raw = torch.tanh(raw_delta[:, 0:1])
-            delta_mu_raw = torch.tanh(raw_delta[:, 1:2])
-        correction_gate = build_correction_gate(
-            interface_indicator,
-            class_probs,
-            mode=self.correction_gate_mode,
-            locality_scale=self.correction_locality_scale,
-            locality_power=self.correction_locality_power,
-        )
-        active_scale = float(getattr(self, "active_correction_scale", 1.0))
-        delta_lambda = active_scale * self.correction_lambda_scale * correction_gate * delta_lambda_raw
-        delta_mu = active_scale * self.correction_mu_scale * correction_gate * delta_mu_raw
-
-        if self.correction_mode == "additive":
-            lmbd = torch.clamp(coarse_lambda + delta_lambda, min=self.lambda_floor)
-            mu = torch.clamp(coarse_mu + delta_mu, min=self.mu_floor)
-        elif self.correction_mode == "multiplicative":
-            lmbd = torch.clamp(coarse_lambda * (1.0 + delta_lambda), min=self.lambda_floor)
-            mu = torch.clamp(coarse_mu * (1.0 + delta_mu), min=self.mu_floor)
-        else:
-            raise ValueError(f"Unsupported correction_mode: {self.correction_mode}")
-
-        return lmbd, mu, interface_indicator, class_probs, geometry, {
-            "coarse_lambda": coarse_lambda,
-            "coarse_mu": coarse_mu,
-            "delta_lambda": delta_lambda,
-            "delta_mu": delta_mu,
-            "correction_gate": correction_gate,
-            "active_correction_scale": torch.full_like(coarse_lambda, active_scale),
-        }
+            lambda_regions = self.lambda_floor + F.softplus(self.raw_lambda_params)
+            mu_regions = self.mu_floor + F.softplus(self.raw_mu_params)
+            lmbd = torch.sum(class_probs * lambda_regions.unsqueeze(0), dim=1, keepdim=True)
+            mu = torch.sum(class_probs * mu_regions.unsqueeze(0), dim=1, keepdim=True)
+            aux = {
+                "lambda_regions": lambda_regions,
+                "mu_regions": mu_regions,
+            }
+        return lmbd, mu, phase_logits, class_probs, aux
 
     def forward(self, inputs):
         x = inputs
@@ -880,22 +831,22 @@ class GeometryCoarseToFineMaterialNet(GeometryAwareMaterialNet):
             x = self._input_transform(inputs)
         features = self.features(x)
         state_outputs = self.state_net(features)
-        lmbd, mu, _, _, _, _ = self._material_from_inputs(inputs)
-        outputs = torch.cat((state_outputs, lmbd, mu), dim=1)
-        return outputs
+        lmbd, mu, _, _, _ = self._material_from_features(features)
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
 
     def predict_material_diagnostics(self, inputs):
-        lmbd, mu, interface_indicator, class_probs, geometry, correction = self._material_from_inputs(inputs)
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        lmbd, mu, phase_logits, class_probs, aux = self._material_from_features(features)
         diagnostics = {
             "lambda": lmbd,
             "mu": mu,
-            "interface_indicator": interface_indicator,
+            "interface_indicator": phase_logits,
             "class_probs": class_probs,
-            "lambda_regions": self.lambda_floor + F.softplus(self.raw_lambda_params),
-            "mu_regions": self.mu_floor + F.softplus(self.raw_mu_params),
         }
-        diagnostics.update(geometry)
-        diagnostics.update(correction)
+        diagnostics.update(aux)
         return diagnostics
 
 
@@ -918,7 +869,7 @@ def count_trainable_parameters(net):
 
 
 def is_compact_material_method(method):
-    return method in {"iaminn_v2", "geoiaminn", "geocofinet"}
+    return method in {"iaminn_v2", "geoiaminn", "geoiaminn_v3"}
 
 
 def build_network(args):
@@ -934,26 +885,6 @@ def build_network(args):
             interface_sharpness=args.interface_sharpness,
             backbone_type=args.backbone_type,
         )
-    elif args.method == "geocofinet":
-        net = GeometryCoarseToFineMaterialNet(
-            case_name=args.case,
-            state_hidden_layers=parse_hidden_layers(args.state_layers),
-            residual_hidden_layers=parse_hidden_layers(args.residual_hidden_layers),
-            activation=args.activation,
-            num_frequencies=args.num_frequencies,
-            residual_num_frequencies=args.residual_num_frequencies,
-            lambda_floor=args.lambda_floor,
-            mu_floor=args.mu_floor,
-            interface_sharpness=args.interface_sharpness,
-            correction_mode=args.correction_mode,
-            correction_gate_mode=args.correction_gate_mode,
-            correction_lambda_scale=args.correction_lambda_scale,
-            correction_mu_scale=args.correction_mu_scale,
-            correction_locality_scale=args.correction_locality_scale,
-            correction_locality_power=args.correction_locality_power,
-            split_residual_heads=args.split_residual_heads,
-            backbone_type=args.backbone_type,
-        )
     elif args.method == "geoiaminn":
         net = GeometryAwareMaterialNet(
             case_name=args.case,
@@ -963,6 +894,20 @@ def build_network(args):
             lambda_floor=args.lambda_floor,
             mu_floor=args.mu_floor,
             interface_sharpness=args.interface_sharpness,
+            backbone_type=args.backbone_type,
+        )
+    elif args.method == "geoiaminn_v3":
+        net = SmoothGeometryAwareMaterialNetV3(
+            num_loads=compact_num_loads(args),
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            geometry_hidden_layers=parse_hidden_layers(args.geometry_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            k_floor=args.k_floor,
+            interface_sharpness=args.interface_sharpness,
+            parameterization=args.material_parameterization,
             backbone_type=args.backbone_type,
         )
     else:
@@ -977,33 +922,39 @@ def build_network(args):
 
 
 
-def build_pde(case_config, reg_weight, method=None):
+def build_pde(case_config, reg_weight, method=None, load_scales=None):
     def pde(x, y):
-        ux_x = dde.grad.jacobian(y, x, i=0, j=0)
-        ux_y = dde.grad.jacobian(y, x, i=0, j=1)
-        uy_x = dde.grad.jacobian(y, x, i=1, j=0)
-        uy_y = dde.grad.jacobian(y, x, i=1, j=1)
-        exx = ux_x
-        eyy = uy_y
-        exy = 0.5 * (ux_y + uy_x)
         if is_compact_material_method(method):
-            lambda_idx, mu_idx = 2, 3
+            compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
+            lambda_idx = 2 * len(compact_load_scales)
+            mu_idx = lambda_idx + 1
             lmbd = y[:, lambda_idx:lambda_idx + 1]
             mu = y[:, mu_idx:mu_idx + 1]
-            constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
-            constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
-            constitutive_sxy = 2.0 * mu * exy
-
-            sxx_x = dde.grad.jacobian(constitutive_sxx, x, i=0, j=0)
-            syy_y = dde.grad.jacobian(constitutive_syy, x, i=0, j=1)
-            sxy_x = dde.grad.jacobian(constitutive_sxy, x, i=0, j=0)
-            sxy_y = dde.grad.jacobian(constitutive_sxy, x, i=0, j=1)
-
-            fx, fy = exact_body_force_torch(x, case_config)
-            residuals = [
-                sxx_x + sxy_y + fx,
-                sxy_x + syy_y + fy,
-            ]
+            residuals = []
+            for load_index, load_scale in enumerate(compact_load_scales):
+                ux = y[:, 2 * load_index : 2 * load_index + 1]
+                uy = y[:, 2 * load_index + 1 : 2 * load_index + 2]
+                ux_x = dde.grad.jacobian(ux, x, i=0, j=0)
+                ux_y = dde.grad.jacobian(ux, x, i=0, j=1)
+                uy_x = dde.grad.jacobian(uy, x, i=0, j=0)
+                uy_y = dde.grad.jacobian(uy, x, i=0, j=1)
+                exx = ux_x
+                eyy = uy_y
+                exy = 0.5 * (ux_y + uy_x)
+                constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+                constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+                constitutive_sxy = 2.0 * mu * exy
+                sxx_x = dde.grad.jacobian(constitutive_sxx, x, i=0, j=0)
+                syy_y = dde.grad.jacobian(constitutive_syy, x, i=0, j=1)
+                sxy_x = dde.grad.jacobian(constitutive_sxy, x, i=0, j=0)
+                sxy_y = dde.grad.jacobian(constitutive_sxy, x, i=0, j=1)
+                fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale)
+                residuals.extend(
+                    [
+                        sxx_x + sxy_y + fx,
+                        sxy_x + syy_y + fy,
+                    ]
+                )
             if reg_weight > 0.0:
                 residuals.extend(
                     [
@@ -1015,6 +966,13 @@ def build_pde(case_config, reg_weight, method=None):
                 )
             return residuals
 
+        ux_x = dde.grad.jacobian(y, x, i=0, j=0)
+        ux_y = dde.grad.jacobian(y, x, i=0, j=1)
+        uy_x = dde.grad.jacobian(y, x, i=1, j=0)
+        uy_y = dde.grad.jacobian(y, x, i=1, j=1)
+        exx = ux_x
+        eyy = uy_y
+        exy = 0.5 * (ux_y + uy_x)
         lambda_idx, mu_idx = 5, 6
         lmbd = y[:, lambda_idx:lambda_idx + 1]
         mu = y[:, mu_idx:mu_idx + 1]
@@ -1032,7 +990,7 @@ def build_pde(case_config, reg_weight, method=None):
         sxy_x = dde.grad.jacobian(sxy, x, i=0, j=0)
         sxy_y = dde.grad.jacobian(sxy, x, i=0, j=1)
 
-        fx, fy = exact_body_force_torch(x, case_config)
+        fx, fy = exact_body_force_torch(x, case_config, load_scale=1.0)
         residuals = [
             sxx_x + sxy_y + fx,
             sxy_x + syy_y + fy,
@@ -1054,9 +1012,12 @@ def build_pde(case_config, reg_weight, method=None):
     return pde
 
 
-def pde_loss_names(reg_weight, method=None):
+def pde_loss_names(reg_weight, method=None, load_scales=None):
     if is_compact_material_method(method):
-        names = ["momentum_x", "momentum_y"]
+        compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
+        names = []
+        for load_index in range(len(compact_load_scales)):
+            names.extend([f"momentum_x_l{load_index}", f"momentum_y_l{load_index}"])
     else:
         names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
     if reg_weight > 0.0:
@@ -1064,9 +1025,12 @@ def pde_loss_names(reg_weight, method=None):
     return names
 
 
-def pde_loss_weights(reg_weight, method=None):
+def pde_loss_weights(reg_weight, method=None, load_scales=None):
     if is_compact_material_method(method):
-        weights = [1.0, 1.0]
+        compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
+        weights = []
+        for _ in compact_load_scales:
+            weights.extend([1.0, 1.0])
     else:
         weights = [1.0, 1.0, 1.0, 1.0, 1.0]
     if reg_weight > 0.0:
@@ -1082,31 +1046,36 @@ def resolve_loss_weights(
     data_scale=1.0,
 ):
     weights = []
-    for loss_name in pde_loss_names(args.reg_weight, args.method):
+    for loss_name in pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")):
         if loss_name in {"momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"}:
+            weights.append(float(physics_scale))
+        elif loss_name.startswith("momentum_"):
             weights.append(float(physics_scale))
         else:
             weights.append(float(args.reg_weight) * float(reg_scale))
-    weights.extend(
-        [
-            float(args.boundary_weight) * float(boundary_scale),
-            float(args.boundary_weight) * float(boundary_scale),
-            float(args.data_weight) * float(data_scale),
-            float(args.data_weight) * float(data_scale),
-        ]
-    )
+    num_loads = compact_num_loads(args)
+    for _ in range(num_loads):
+        weights.extend(
+            [
+                float(args.boundary_weight) * float(boundary_scale),
+                float(args.boundary_weight) * float(boundary_scale),
+                float(args.data_weight) * float(data_scale),
+                float(args.data_weight) * float(data_scale),
+            ]
+        )
     return weights
 
 
-def build_observation_payload(points, case_config, noise_level, seed):
+def build_observation_payload(points, case_config, noise_level, seed, load_scale=1.0):
     if len(points) == 0:
         return {
             "points": np.zeros((0, 2), dtype=float),
             "clean": np.zeros((0, 2), dtype=float),
             "noisy": np.zeros((0, 2), dtype=float),
             "true_state": np.zeros((0, len(FIELD_NAMES)), dtype=float),
+            "load_scale": float(load_scale),
         }
-    exact_observation_state = exact_state_numpy(points, case_config)
+    exact_observation_state = exact_state_numpy(points, case_config, load_scale=load_scale)
     clean_observation = exact_observation_state[:, :2]
     noisy_observation = add_noise(clean_observation, noise_level, seed)
     return {
@@ -1114,11 +1083,13 @@ def build_observation_payload(points, case_config, noise_level, seed):
         "clean": clean_observation,
         "noisy": noisy_observation,
         "true_state": exact_observation_state,
+        "load_scale": float(load_scale),
     }
 
 
 def build_data(args, case_config):
     geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
+    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
     observation_splits = build_observation_splits(
         num_train=args.num_observe,
         num_val=args.num_val_observe,
@@ -1126,38 +1097,84 @@ def build_data(args, case_config):
         seed=args.seed + 17,
         case_name=args.case,
         cache_dir=args.observation_cache_dir,
-        tag=args.observation_split_tag,
-    )
-    train_observation = build_observation_payload(
-        observation_splits["train"], case_config, args.noise_level, args.seed + 123
-    )
-    val_observation = build_observation_payload(
-        observation_splits["val"], case_config, args.noise_level, args.seed + 223
-    )
-    eval_observation = build_observation_payload(
-        observation_splits["eval"], case_config, args.noise_level, args.seed + 323
-    )
+            tag=args.observation_split_tag,
+        )
     boundary_points = build_boundary_points(args.num_boundary)
-    boundary_observation = build_observation_payload(boundary_points, case_config, 0.0, args.seed + 423)
+    train_observation_loads = []
+    val_observation_loads = []
+    eval_observation_loads = []
+    boundary_observation_loads = []
+    for load_index, load_scale in enumerate(load_scales):
+        train_observation_loads.append(
+            build_observation_payload(
+                observation_splits["train"],
+                case_config,
+                args.noise_level,
+                args.seed + 123 + 1000 * load_index,
+                load_scale=load_scale,
+            )
+        )
+        val_observation_loads.append(
+            build_observation_payload(
+                observation_splits["val"],
+                case_config,
+                args.noise_level,
+                args.seed + 223 + 1000 * load_index,
+                load_scale=load_scale,
+            )
+        )
+        eval_observation_loads.append(
+            build_observation_payload(
+                observation_splits["eval"],
+                case_config,
+                args.noise_level,
+                args.seed + 323 + 1000 * load_index,
+                load_scale=load_scale,
+            )
+        )
+        boundary_observation_loads.append(
+            build_observation_payload(
+                boundary_points,
+                case_config,
+                0.0,
+                args.seed + 423 + 1000 * load_index,
+                load_scale=load_scale,
+            )
+        )
 
-    boundary_ux = dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 0:1], component=0)
-    boundary_uy = dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 1:2], component=1)
-    observe_ux = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 0:1], component=0)
-    observe_uy = dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 1:2], component=1)
+    bcs = []
+    num_loads = compact_num_loads(args)
+    for load_index in range(num_loads):
+        component_ux, component_uy = compact_state_indices(args, load_index)
+        boundary_observation = boundary_observation_loads[load_index]
+        train_observation = train_observation_loads[load_index]
+        bcs.extend(
+            [
+                dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 0:1], component=component_ux),
+                dde.icbc.PointSetBC(boundary_observation["points"], boundary_observation["clean"][:, 1:2], component=component_uy),
+                dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 0:1], component=component_ux),
+                dde.icbc.PointSetBC(train_observation["points"], train_observation["noisy"][:, 1:2], component=component_uy),
+            ]
+        )
     data = dde.data.PDE(
         geom,
-        build_pde(case_config, args.reg_weight, args.method),
-        [boundary_ux, boundary_uy, observe_ux, observe_uy],
+        build_pde(case_config, args.reg_weight, args.method, load_scales=load_scales),
+        bcs,
         num_domain=args.num_domain,
         num_boundary=0,
         num_test=args.num_test,
         train_distribution="pseudo",
     )
     metadata = {
-        "boundary_observation": boundary_observation,
-        "train_observation": train_observation,
-        "val_observation": val_observation,
-        "eval_observation": eval_observation,
+        "boundary_observation": boundary_observation_loads[0],
+        "train_observation": train_observation_loads[0],
+        "val_observation": val_observation_loads[0],
+        "eval_observation": eval_observation_loads[0],
+        "boundary_observation_loads": boundary_observation_loads,
+        "train_observation_loads": train_observation_loads,
+        "val_observation_loads": val_observation_loads,
+        "eval_observation_loads": eval_observation_loads,
+        "load_scales": load_scales,
         "observation_cache_path": observation_splits.get("cache_path"),
     }
     return geom, data, metadata
@@ -1178,7 +1195,7 @@ def default_experiment_group(method):
         "pinn": "PINN-baseline",
         "iaminn_v2": "IAMINN-v2",
         "geoiaminn": "GeoIAMINN",
-        "geocofinet": "GeoCoFiNet",
+        "geoiaminn_v3": "GeoIAMINN-v3",
     }
     return mapping.get(method, method.upper())
 
@@ -1370,13 +1387,24 @@ def save_training_artifacts(
     metadata,
     net,
 ):
+    num_loads = compact_num_loads(args)
+    bc_loss_names = []
+    for load_index in range(num_loads):
+        bc_loss_names.extend(
+            [
+                f"boundary_ux_l{load_index}",
+                f"boundary_uy_l{load_index}",
+                f"obs_ux_l{load_index}",
+                f"obs_uy_l{load_index}",
+            ]
+        )
     config_payload = {
         "args": {key: value for key, value in vars(args).items() if not key.startswith("_")},
         "case": asdict(case_config),
         "parameter_count": count_trainable_parameters(net),
         "field_names": FIELD_NAMES,
-        "pde_loss_names": pde_loss_names(args.reg_weight, args.method),
-        "bc_loss_names": ["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+        "pde_loss_names": pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+        "bc_loss_names": bc_loss_names,
         "selection_metric": "validation_observation_mse",
         "observation_cache_path": metadata.get("observation_cache_path"),
     }
@@ -1425,21 +1453,21 @@ def save_training_artifacts(
             losshistory,
             save_dir,
             filename="loss_history.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
-            num_bc_losses=4,
+            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0"))),
+            num_bc_losses=len(bc_loss_names),
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
-            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            bc_loss_names=bc_loss_names,
             data_loss_prefix="obs_",
         )
         plot_all_loss_components(
             losshistory,
             save_dir,
             filename="loss_components.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method)),
-            num_bc_losses=4,
-            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
-            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0"))),
+            num_bc_losses=len(bc_loss_names),
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+            bc_loss_names=bc_loss_names,
         )
         save_loss_history_json(losshistory, save_dir, filename="loss_history.json")
         save_best_test_loss_json(losshistory, save_dir, filename="best_test_loss.json")
@@ -1456,7 +1484,7 @@ def save_training_artifacts(
         }
         save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
         save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
-    elif args.method in {"geoiaminn", "geocofinet"} and hasattr(net, "predict_material_diagnostics"):
+    elif args.method in {"geoiaminn", "geoiaminn_v3"} and hasattr(net, "predict_material_diagnostics"):
         device = next(net.parameters()).device
         with torch.no_grad():
             diagnostics = net.predict_material_diagnostics(torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device))
@@ -1468,7 +1496,8 @@ def save_training_artifacts(
         for key, value in diagnostics.items():
             if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
                 continue
-            region_payload[key] = float(value.detach().cpu().item())
+            if torch.is_tensor(value) and value.numel() == 1:
+                region_payload[key] = float(value.detach().cpu().item())
         save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
         save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
 
@@ -1547,7 +1576,7 @@ def _predict_compact_raw(model, points, batch_size=4096):
     return np.concatenate(outputs, axis=0)
 
 
-def _predict_compact_full_fields(model, points, args, batch_size=2048):
+def _predict_compact_full_fields(model, points, args, batch_size=2048, load_index=0):
     net = model.net
     device = next(net.parameters()).device
     predictions = []
@@ -1556,10 +1585,12 @@ def _predict_compact_full_fields(model, points, args, batch_size=2048):
         batch_points = points[start : start + batch_size]
         x = torch.tensor(batch_points, dtype=torch.float32, device=device, requires_grad=True)
         raw = net(x)
-        ux = raw[:, 0:1]
-        uy = raw[:, 1:2]
-        lmbd = raw[:, 2:3]
-        mu = raw[:, 3:4]
+        ux_idx, uy_idx = compact_state_indices(args, load_index)
+        lambda_idx, mu_idx = compact_material_indices(args)
+        ux = raw[:, ux_idx:ux_idx + 1]
+        uy = raw[:, uy_idx:uy_idx + 1]
+        lmbd = raw[:, lambda_idx:lambda_idx + 1]
+        mu = raw[:, mu_idx:mu_idx + 1]
         ux_grad = torch.autograd.grad(ux, x, grad_outputs=torch.ones_like(ux), create_graph=False, retain_graph=True)[0]
         uy_grad = torch.autograd.grad(uy, x, grad_outputs=torch.ones_like(uy), create_graph=False, retain_graph=False)[0]
         exx = ux_grad[:, 0:1]
@@ -1597,13 +1628,21 @@ def predict_material_diagnostics(model, points, args, batch_size=4096):
     }
 
 
-def predict_full_fields(model, points, args, batch_size=4096):
+def predict_full_fields(model, points, args, batch_size=4096, load_index=0):
     if is_compact_material_method(args.method):
-        return _predict_compact_full_fields(model, points, args, batch_size=batch_size)
+        return _predict_compact_full_fields(model, points, args, batch_size=batch_size, load_index=load_index)
     return np.asarray(model.predict(points))
 
 
 def compute_observation_mse(model, args, observation_points, observation_truth):
+    if isinstance(observation_points, list):
+        mses = []
+        for load_index, (points, truth) in enumerate(zip(observation_points, observation_truth)):
+            if len(points) == 0:
+                continue
+            observation_prediction = predict_full_fields(model, points, args, load_index=load_index)[:, :2]
+            mses.append(float(np.mean((observation_prediction - truth) ** 2)))
+        return float(np.mean(mses)) if mses else float("nan")
     if len(observation_points) == 0:
         return float("nan")
     observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
@@ -1807,12 +1846,18 @@ def evaluate_model(
     save_artifacts=True,
 ):
     eval_points, xx, yy = make_grid(args.eval_nx, args.eval_ny)
-    truth = exact_state_numpy(eval_points, case_config)
-    prediction = predict_full_fields(model, eval_points, args)
+    primary_load_index = int(getattr(args, "primary_load_index", 0))
+    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
+    primary_scale = load_scales[min(primary_load_index, len(load_scales) - 1)]
+    truth = exact_state_numpy(eval_points, case_config, load_scale=primary_scale)
+    prediction = predict_full_fields(model, eval_points, args, load_index=primary_load_index)
     residual = split_residual_prediction(
-        model.predict(eval_points, operator=build_pde(case_config, args.reg_weight, args.method))
+        model.predict(
+            eval_points,
+            operator=build_pde(case_config, args.reg_weight, args.method, load_scales=getattr(args, "load_scales", "1.0")),
+        )
     )
-    observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
+    observation_prediction = predict_full_fields(model, observation_points, args, load_index=primary_load_index)[:, :2]
     material_diagnostics = predict_material_diagnostics(model, eval_points, args)
 
     metrics = compute_metrics(
@@ -1920,7 +1965,18 @@ def build_model(args, data):
 
 
 def make_callbacks(args, save_dir, metadata):
-    num_pde = len(pde_loss_names(args.reg_weight, args.method))
+    num_pde = len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")))
+    num_loads = compact_num_loads(args)
+    bc_loss_names = []
+    for load_index in range(num_loads):
+        bc_loss_names.extend(
+            [
+                f"boundary_ux_l{load_index}",
+                f"boundary_uy_l{load_index}",
+                f"obs_ux_l{load_index}",
+                f"obs_uy_l{load_index}",
+            ]
+        )
     model_dir = ensure_dir(os.path.join(save_dir, "model"))
     callbacks = [
         LossHistoryCallback(
@@ -1928,9 +1984,9 @@ def make_callbacks(args, save_dir, metadata):
             period=args.display_every,
             filename="loss_history.png",
             num_pde_losses=num_pde,
-            num_bc_losses=4,
-            pde_loss_names=pde_loss_names(args.reg_weight, args.method),
-            bc_loss_names=["boundary_ux", "boundary_uy", "obs_ux", "obs_uy"],
+            num_bc_losses=len(bc_loss_names),
+            pde_loss_names=pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+            bc_loss_names=bc_loss_names,
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
             save_all_components=True,
@@ -1938,8 +1994,8 @@ def make_callbacks(args, save_dir, metadata):
         ValidationObservationCheckpoint(
             filepath=os.path.join(model_dir, "best_model"),
             save_dir=save_dir,
-            observation_points=metadata["val_observation"]["points"],
-            observation_truth_clean=metadata["val_observation"]["noisy"],
+            observation_points=[payload["points"] for payload in metadata.get("val_observation_loads", [metadata["val_observation"]])],
+            observation_truth_clean=[payload["noisy"] for payload in metadata.get("val_observation_loads", [metadata["val_observation"]])],
             args=args,
             period=args.display_every,
             verbose=1,
@@ -1962,7 +2018,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn", "iaminn_v2", "geoiaminn", "geocofinet"],
+        choices=["pinn", "iaminn_v2", "geoiaminn", "geoiaminn_v3"],
         default="pinn",
     )
     parser.add_argument(
@@ -1990,18 +2046,14 @@ def build_common_parser(description):
     parser.add_argument("--backbone_type", choices=["mlp", "resmlp"], default="mlp")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
     parser.add_argument("--state_layers", type=str, default="128,128,128,128")
+    parser.add_argument("--geometry_layers", type=str, default="64,64,64")
     parser.add_argument("--interface_layers", type=str, default="128,128,128,128")
-    parser.add_argument("--residual_hidden_layers", type=str, default="64,64")
     parser.add_argument("--interface_sharpness", type=float, default=10.0)
     parser.add_argument("--num_frequencies", type=int, default=4)
-    parser.add_argument("--residual_num_frequencies", type=int, default=0)
-    parser.add_argument("--correction_mode", choices=["additive", "multiplicative"], default="multiplicative")
-    parser.add_argument("--correction_gate_mode", choices=["none", "uncertainty", "entropy", "interface", "interface_uncertainty", "interface_entropy"], default="uncertainty")
-    parser.add_argument("--correction_lambda_scale", type=float, default=0.25)
-    parser.add_argument("--correction_mu_scale", type=float, default=0.25)
-    parser.add_argument("--correction_locality_scale", type=float, default=1.0)
-    parser.add_argument("--correction_locality_power", type=float, default=1.0)
-    parser.add_argument("--split_residual_heads", action="store_true")
+    parser.add_argument("--material_parameterization", choices=["bulkmu", "lamemu"], default="bulkmu")
+    parser.add_argument("--k_floor", type=float, default=0.2)
+    parser.add_argument("--load_scales", type=str, default="1.0")
+    parser.add_argument("--primary_load_index", type=int, default=0)
     parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
     parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
     parser.add_argument("--exp_root", type=str, default=DEFAULT_EXP_ROOT)
@@ -2022,6 +2074,9 @@ def prepare_run(args):
         raise ValueError("num_eval_observe must be positive for held-out evaluation.")
     if args.num_boundary <= 0:
         raise ValueError("num_boundary must be positive when using unified soft boundary constraints.")
+    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
+    if int(getattr(args, "primary_load_index", 0)) < 0 or int(getattr(args, "primary_load_index", 0)) >= len(load_scales):
+        raise ValueError("primary_load_index is out of range for load_scales.")
     set_random_seed(args.seed)
     if args.device_debug:
         print_gpu_info()
