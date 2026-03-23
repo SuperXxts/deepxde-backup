@@ -1562,7 +1562,32 @@ def split_residual_prediction(residual_prediction):
     return array
 
 
-def _predict_compact_raw(model, points, batch_size=4096):
+def _manual_fourier_features(x, num_frequencies):
+    num_frequencies = int(num_frequencies)
+    if num_frequencies <= 0:
+        return x
+    features = [x]
+    freq_bands = 2.0 ** torch.arange(num_frequencies, dtype=x.dtype, device=x.device)
+    for freq in freq_bands:
+        features.append(torch.sin(2.0 * PI * freq * x))
+        features.append(torch.cos(2.0 * PI * freq * x))
+    return torch.cat(features, dim=1)
+
+
+def _forward_compact_raw_tensor(net, x, args):
+    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net") and hasattr(net, "_material_from_inputs"):
+        state_inputs = x
+        if getattr(net, "_input_transform", None) is not None:
+            state_inputs = net._input_transform(x)
+        num_frequencies = getattr(getattr(net, "features", None), "num_frequencies", 0)
+        features = _manual_fourier_features(state_inputs, num_frequencies)
+        state_outputs = net.state_net(features)
+        lmbd, mu, _, _, _ = net._material_from_inputs(x)
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
+    return net(x)
+
+
+def _predict_compact_raw(model, points, args, batch_size=4096):
     net = model.net
     device = next(net.parameters()).device
     outputs = []
@@ -1571,7 +1596,7 @@ def _predict_compact_raw(model, points, batch_size=4096):
         batch_points = points[start : start + batch_size]
         x = torch.tensor(batch_points, dtype=torch.float32, device=device)
         with torch.no_grad():
-            batch_output = net(x)
+            batch_output = _forward_compact_raw_tensor(net, x, args)
         outputs.append(batch_output.detach().cpu().numpy())
     return np.concatenate(outputs, axis=0)
 
@@ -1584,7 +1609,7 @@ def _predict_compact_full_fields(model, points, args, batch_size=2048, load_inde
     for start in range(0, len(points), batch_size):
         batch_points = points[start : start + batch_size]
         x = torch.tensor(batch_points, dtype=torch.float32, device=device, requires_grad=True)
-        raw = net(x)
+        raw = _forward_compact_raw_tensor(net, x, args)
         ux_idx, uy_idx = compact_state_indices(args, load_index)
         lambda_idx, mu_idx = compact_material_indices(args)
         ux = raw[:, ux_idx:ux_idx + 1]
@@ -1640,12 +1665,12 @@ def compute_observation_mse(model, args, observation_points, observation_truth):
         for load_index, (points, truth) in enumerate(zip(observation_points, observation_truth)):
             if len(points) == 0:
                 continue
-            observation_prediction = predict_full_fields(model, points, args, load_index=load_index)[:, :2]
+            observation_prediction = _predict_compact_raw(model, points, args, batch_size=4096)[:, compact_state_indices(args, load_index)[0]:compact_state_indices(args, load_index)[0] + 2] if is_compact_material_method(args.method) else predict_full_fields(model, points, args, load_index=load_index)[:, :2]
             mses.append(float(np.mean((observation_prediction - truth) ** 2)))
         return float(np.mean(mses)) if mses else float("nan")
     if len(observation_points) == 0:
         return float("nan")
-    observation_prediction = predict_full_fields(model, observation_points, args)[:, :2]
+    observation_prediction = _predict_compact_raw(model, observation_points, args, batch_size=4096)[:, compact_state_indices(args, 0)[0]:compact_state_indices(args, 0)[0] + 2] if is_compact_material_method(args.method) else predict_full_fields(model, observation_points, args)[:, :2]
     return float(np.mean((observation_prediction - observation_truth) ** 2))
 
 
