@@ -1562,55 +1562,12 @@ def split_residual_prediction(residual_prediction):
     return array
 
 
-def _manual_fourier_features(x, num_frequencies):
-    num_frequencies = int(num_frequencies)
-    if num_frequencies <= 0:
-        return x
-    features = [x]
-    freq_bands = 2.0 ** torch.arange(num_frequencies, dtype=x.dtype, device=x.device)
-    for freq in freq_bands:
-        features.append(torch.sin(2.0 * PI * freq * x))
-        features.append(torch.cos(2.0 * PI * freq * x))
-    return torch.cat(features, dim=1)
-
-
-def _infer_feature_dimension_from_state_net(net):
-    state_net = getattr(net, "state_net", None)
-    if state_net is None:
-        return None
-    modules = getattr(state_net, "net", state_net)
-    if isinstance(modules, nn.Module):
-        modules = list(modules.modules())
-    for module in modules:
-        if isinstance(module, nn.Linear):
-            return int(module.in_features)
-    return None
-
-
-def _make_state_features_for_prediction(net, x):
-    state_inputs = x
-    if getattr(net, "_input_transform", None) is not None:
-        state_inputs = net._input_transform(x)
-    feature_module = getattr(net, "features", None)
-    features = feature_module(state_inputs) if callable(feature_module) else state_inputs
-    expected_dim = _infer_feature_dimension_from_state_net(net)
-    if expected_dim is not None and features.shape[1] != expected_dim and state_inputs.shape[1] == 2:
-        if expected_dim >= 2 and (expected_dim - 2) % 4 == 0:
-            inferred_num_frequencies = (expected_dim - 2) // 4
-            features = _manual_fourier_features(state_inputs, inferred_num_frequencies)
-    return features
-
-
 def _forward_compact_raw_tensor(net, x, args):
-    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net"):
-        features = _make_state_features_for_prediction(net, x)
-        state_outputs = net.state_net(features)
-        if hasattr(net, "_material_from_features"):
-            lmbd, mu, _, _, _ = net._material_from_features(features)
-            return torch.cat((state_outputs, lmbd, mu), dim=1)
-        if hasattr(net, "_material_from_inputs"):
-            lmbd, mu, _, _, _ = net._material_from_inputs(x)
-            return torch.cat((state_outputs, lmbd, mu), dim=1)
+    """Use the model native forward path for compact methods.
+
+    Prediction-time forward must match training-time forward to avoid
+    architecture-dependent feature-shape drift in staged training.
+    """
     return net(x)
 
 
