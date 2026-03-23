@@ -1575,15 +1575,19 @@ def _manual_fourier_features(x, num_frequencies):
 
 
 def _forward_compact_raw_tensor(net, x, args):
-    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net") and hasattr(net, "_material_from_inputs"):
+    if getattr(args, "method", "") == "geoiaminn_v3" and hasattr(net, "state_net") and hasattr(net, "features"):
         state_inputs = x
         if getattr(net, "_input_transform", None) is not None:
             state_inputs = net._input_transform(x)
         num_frequencies = getattr(getattr(net, "features", None), "num_frequencies", 0)
         features = _manual_fourier_features(state_inputs, num_frequencies)
         state_outputs = net.state_net(features)
-        lmbd, mu, _, _, _ = net._material_from_inputs(x)
-        return torch.cat((state_outputs, lmbd, mu), dim=1)
+        if hasattr(net, "_material_from_features"):
+            lmbd, mu, _, _, _ = net._material_from_features(features)
+            return torch.cat((state_outputs, lmbd, mu), dim=1)
+        if hasattr(net, "_material_from_inputs"):
+            lmbd, mu, _, _, _ = net._material_from_inputs(x)
+            return torch.cat((state_outputs, lmbd, mu), dim=1)
     return net(x)
 
 
