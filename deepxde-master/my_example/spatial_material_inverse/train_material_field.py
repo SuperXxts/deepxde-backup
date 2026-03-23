@@ -32,7 +32,7 @@ from shared import (
     save_training_artifacts,
     plot_all_loss_components,
     plot_and_save_loss_history,
-    parse_load_scales,
+    resolve_load_specs,
 )
 
 
@@ -276,9 +276,11 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     lambda_idx, mu_idx = compact_material_indices(args)
     lmbd = raw[:, lambda_idx:lambda_idx + 1]
     mu = raw[:, mu_idx:mu_idx + 1]
-    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
+    load_specs = resolve_load_specs(getattr(args, "load_scales", "1.0"), getattr(args, "load_modes", ""))
     physics_mse = torch.zeros((), dtype=torch.float32, device=device)
-    for load_index, load_scale in enumerate(load_scales):
+    for load_index, load_spec in enumerate(load_specs):
+        load_scale = float(load_spec["scale"])
+        load_mode = str(load_spec["mode"])
         ux_idx, uy_idx = compact_state_indices(args, load_index)
         ux = raw[:, ux_idx:ux_idx + 1]
         uy = raw[:, uy_idx:uy_idx + 1]
@@ -293,11 +295,11 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
         sxx_grad = torch.autograd.grad(sxx, x, grad_outputs=torch.ones_like(sxx), create_graph=True, retain_graph=True)[0]
         syy_grad = torch.autograd.grad(syy, x, grad_outputs=torch.ones_like(syy), create_graph=True, retain_graph=True)[0]
         sxy_grad = torch.autograd.grad(sxy, x, grad_outputs=torch.ones_like(sxy), create_graph=True, retain_graph=True)[0]
-        fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale)
+        fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale, load_mode=load_mode)
         momentum_x = sxx_grad[:, 0:1] + sxy_grad[:, 1:2] + fx
         momentum_y = sxy_grad[:, 0:1] + syy_grad[:, 1:2] + fy
         physics_mse = physics_mse + torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
-    physics_mse = physics_mse / float(max(len(load_scales), 1))
+    physics_mse = physics_mse / float(max(len(load_specs), 1))
 
     lambda_grad = torch.autograd.grad(lmbd, x, grad_outputs=torch.ones_like(lmbd), create_graph=True, retain_graph=True)[0]
     mu_grad = torch.autograd.grad(mu, x, grad_outputs=torch.ones_like(mu), create_graph=True, retain_graph=True)[0]
@@ -324,7 +326,6 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
         dim=1,
     )
     reg_mse = torch.mean(reg_terms**2)
-    physics_mse = torch.mean(momentum_x**2) + torch.mean(momentum_y**2)
     geometry_prior = torch.zeros((), dtype=torch.float32, device=device)
     geometry_values = {}
     for key, value in diagnostics.items():

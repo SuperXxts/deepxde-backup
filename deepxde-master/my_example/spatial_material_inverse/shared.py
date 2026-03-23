@@ -115,30 +115,60 @@ def parse_load_scales(value):
     return scales
 
 
-def compact_num_loads(args_or_method, load_scales=None):
-    if hasattr(args_or_method, "method"):
-        method = args_or_method.method
-        load_scale_value = getattr(args_or_method, "load_scales", "1.0")
+def parse_load_modes(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        modes = [str(v).strip().lower() for v in value if str(v).strip()]
     else:
-        method = str(args_or_method)
+        text = str(value).strip()
+        if not text:
+            return []
+        modes = [v.strip().lower() for v in text.split(",") if v.strip()]
+    valid_modes = {"legacy", "x_tension", "y_tension", "shear"}
+    for mode in modes:
+        if mode not in valid_modes:
+            raise ValueError(f"Unsupported load mode: {mode}. Valid modes: {sorted(valid_modes)}")
+    return modes
+
+
+def resolve_load_specs(load_scales, load_modes=None):
+    scales = parse_load_scales(load_scales)
+    modes = parse_load_modes(load_modes)
+    if not modes:
+        modes = ["legacy"] * len(scales)
+    elif len(modes) == 1 and len(scales) > 1:
+        modes = modes * len(scales)
+    elif len(scales) == 1 and len(modes) > 1:
+        scales = scales * len(modes)
+    elif len(modes) != len(scales):
+        raise ValueError("load_modes and load_scales must have the same length, or one of them must have length 1.")
+    return [{"scale": float(scale), "mode": str(mode)} for scale, mode in zip(scales, modes)]
+
+
+def compact_num_loads(args_or_method, load_scales=None, load_modes=None):
+    if hasattr(args_or_method, "method"):
+        load_scale_value = getattr(args_or_method, "load_scales", "1.0")
+        load_mode_value = getattr(args_or_method, "load_modes", "")
+    else:
         load_scale_value = load_scales if load_scales is not None else "1.0"
-    if method == "geoiaminn_v3":
-        return len(parse_load_scales(load_scale_value))
-    return 1
+        load_mode_value = load_modes if load_modes is not None else ""
+    return len(resolve_load_specs(load_scale_value, load_mode_value))
 
 
 def compact_material_indices(args):
     num_loads = compact_num_loads(args)
-    if args.method == "geoiaminn_v3":
+    if is_compact_material_method(args.method):
         return 2 * num_loads, 2 * num_loads + 1
-    return 2, 3
+    return 5 * num_loads, 5 * num_loads + 1
 
 
 def compact_state_indices(args, load_index=0):
-    if args.method == "geoiaminn_v3":
+    if is_compact_material_method(args.method):
         start = 2 * int(load_index)
-        return start, start + 1
-    return 0, 1
+    else:
+        start = 5 * int(load_index)
+    return start, start + 1
 
 
 def smooth_step_numpy(value):
@@ -231,29 +261,62 @@ def exact_material_torch(x, case_config):
     return lmbd, mu
 
 
-def exact_displacement_numpy(points, case_config, load_scale=1.0):
+def exact_displacement_numpy(points, case_config, load_scale=1.0, load_mode="legacy"):
     x = points[:, 0:1]
     y = points[:, 1:2]
-    ux = load_scale * case_config.amplitude_u * np.sin(PI * x) * np.sin(PI * y)
-    uy = load_scale * case_config.amplitude_v * np.sin(2.0 * PI * x) * np.sin(PI * y)
+    mode = str(load_mode).strip().lower()
+    base_amp = max(abs(case_config.amplitude_u), abs(case_config.amplitude_v), 1e-8)
+    if mode in {"", "legacy"}:
+        ux = load_scale * case_config.amplitude_u * np.sin(PI * x) * np.sin(PI * y)
+        uy = load_scale * case_config.amplitude_v * np.sin(2.0 * PI * x) * np.sin(PI * y)
+    elif mode == "x_tension":
+        ux = load_scale * base_amp * np.sin(PI * x) * np.sin(PI * y)
+        uy = np.zeros_like(ux)
+    elif mode == "y_tension":
+        uy = load_scale * base_amp * np.sin(PI * x) * np.sin(PI * y)
+        ux = np.zeros_like(uy)
+    elif mode == "shear":
+        ux = load_scale * base_amp * np.sin(PI * x) * np.sin(2.0 * PI * y)
+        uy = load_scale * base_amp * np.sin(2.0 * PI * x) * np.sin(PI * y)
+    else:
+        raise ValueError(f"Unsupported load_mode: {load_mode}")
     return ux, uy
 
 
-def exact_strain_numpy(points, case_config, load_scale=1.0):
+def exact_strain_numpy(points, case_config, load_scale=1.0, load_mode="legacy"):
     x = points[:, 0:1]
     y = points[:, 1:2]
-    exx = load_scale * case_config.amplitude_u * PI * np.cos(PI * x) * np.sin(PI * y)
-    eyy = load_scale * case_config.amplitude_v * PI * np.sin(2.0 * PI * x) * np.cos(PI * y)
-    exy = 0.5 * (
-        load_scale * case_config.amplitude_u * PI * np.sin(PI * x) * np.cos(PI * y)
-        + load_scale * case_config.amplitude_v * 2.0 * PI * np.cos(2.0 * PI * x) * np.sin(PI * y)
-    )
+    mode = str(load_mode).strip().lower()
+    base_amp = max(abs(case_config.amplitude_u), abs(case_config.amplitude_v), 1e-8)
+    if mode in {"", "legacy"}:
+        exx = load_scale * case_config.amplitude_u * PI * np.cos(PI * x) * np.sin(PI * y)
+        eyy = load_scale * case_config.amplitude_v * PI * np.sin(2.0 * PI * x) * np.cos(PI * y)
+        exy = 0.5 * (
+            load_scale * case_config.amplitude_u * PI * np.sin(PI * x) * np.cos(PI * y)
+            + load_scale * case_config.amplitude_v * 2.0 * PI * np.cos(2.0 * PI * x) * np.sin(PI * y)
+        )
+    elif mode == "x_tension":
+        exx = load_scale * base_amp * PI * np.cos(PI * x) * np.sin(PI * y)
+        eyy = np.zeros_like(exx)
+        exy = 0.5 * load_scale * base_amp * PI * np.sin(PI * x) * np.cos(PI * y)
+    elif mode == "y_tension":
+        exx = np.zeros_like(x)
+        eyy = load_scale * base_amp * PI * np.sin(PI * x) * np.cos(PI * y)
+        exy = 0.5 * load_scale * base_amp * PI * np.cos(PI * x) * np.sin(PI * y)
+    elif mode == "shear":
+        exx = load_scale * base_amp * PI * np.cos(PI * x) * np.sin(2.0 * PI * y)
+        eyy = load_scale * base_amp * PI * np.sin(2.0 * PI * x) * np.cos(PI * y)
+        exy = load_scale * base_amp * PI * (
+            np.sin(PI * x) * np.cos(2.0 * PI * y) + np.cos(2.0 * PI * x) * np.sin(PI * y)
+        )
+    else:
+        raise ValueError(f"Unsupported load_mode: {load_mode}")
     return exx, eyy, exy
 
 
-def exact_state_numpy(points, case_config, load_scale=1.0):
-    ux, uy = exact_displacement_numpy(points, case_config, load_scale=load_scale)
-    exx, eyy, exy = exact_strain_numpy(points, case_config, load_scale=load_scale)
+def exact_state_numpy(points, case_config, load_scale=1.0, load_mode="legacy"):
+    ux, uy = exact_displacement_numpy(points, case_config, load_scale=load_scale, load_mode=load_mode)
+    exx, eyy, exy = exact_strain_numpy(points, case_config, load_scale=load_scale, load_mode=load_mode)
     lmbd, mu = exact_material_numpy(points, case_config)
     trace = exx + eyy
     sxx = lmbd * trace + 2.0 * mu * exx
@@ -262,17 +325,42 @@ def exact_state_numpy(points, case_config, load_scale=1.0):
     return np.hstack((ux, uy, sxx, syy, sxy, lmbd, mu))
 
 
-def exact_state_torch(x, case_config, load_scale=1.0):
+def exact_state_torch(x, case_config, load_scale=1.0, load_mode="legacy"):
     px = x[:, 0:1]
     py = x[:, 1:2]
-    ux = load_scale * case_config.amplitude_u * torch.sin(PI * px) * torch.sin(PI * py)
-    uy = load_scale * case_config.amplitude_v * torch.sin(2.0 * PI * px) * torch.sin(PI * py)
-    exx = load_scale * case_config.amplitude_u * PI * torch.cos(PI * px) * torch.sin(PI * py)
-    eyy = load_scale * case_config.amplitude_v * PI * torch.sin(2.0 * PI * px) * torch.cos(PI * py)
-    exy = 0.5 * (
-        load_scale * case_config.amplitude_u * PI * torch.sin(PI * px) * torch.cos(PI * py)
-        + load_scale * case_config.amplitude_v * 2.0 * PI * torch.cos(2.0 * PI * px) * torch.sin(PI * py)
-    )
+    mode = str(load_mode).strip().lower()
+    base_amp = max(abs(case_config.amplitude_u), abs(case_config.amplitude_v), 1e-8)
+    if mode in {"", "legacy"}:
+        ux = load_scale * case_config.amplitude_u * torch.sin(PI * px) * torch.sin(PI * py)
+        uy = load_scale * case_config.amplitude_v * torch.sin(2.0 * PI * px) * torch.sin(PI * py)
+        exx = load_scale * case_config.amplitude_u * PI * torch.cos(PI * px) * torch.sin(PI * py)
+        eyy = load_scale * case_config.amplitude_v * PI * torch.sin(2.0 * PI * px) * torch.cos(PI * py)
+        exy = 0.5 * (
+            load_scale * case_config.amplitude_u * PI * torch.sin(PI * px) * torch.cos(PI * py)
+            + load_scale * case_config.amplitude_v * 2.0 * PI * torch.cos(2.0 * PI * px) * torch.sin(PI * py)
+        )
+    elif mode == "x_tension":
+        ux = load_scale * base_amp * torch.sin(PI * px) * torch.sin(PI * py)
+        uy = torch.zeros_like(ux)
+        exx = load_scale * base_amp * PI * torch.cos(PI * px) * torch.sin(PI * py)
+        eyy = torch.zeros_like(exx)
+        exy = 0.5 * load_scale * base_amp * PI * torch.sin(PI * px) * torch.cos(PI * py)
+    elif mode == "y_tension":
+        uy = load_scale * base_amp * torch.sin(PI * px) * torch.sin(PI * py)
+        ux = torch.zeros_like(uy)
+        exx = torch.zeros_like(ux)
+        eyy = load_scale * base_amp * PI * torch.sin(PI * px) * torch.cos(PI * py)
+        exy = 0.5 * load_scale * base_amp * PI * torch.cos(PI * px) * torch.sin(PI * py)
+    elif mode == "shear":
+        ux = load_scale * base_amp * torch.sin(PI * px) * torch.sin(2.0 * PI * py)
+        uy = load_scale * base_amp * torch.sin(2.0 * PI * px) * torch.sin(PI * py)
+        exx = load_scale * base_amp * PI * torch.cos(PI * px) * torch.sin(2.0 * PI * py)
+        eyy = load_scale * base_amp * PI * torch.sin(2.0 * PI * px) * torch.cos(PI * py)
+        exy = load_scale * base_amp * PI * (
+            torch.sin(PI * px) * torch.cos(2.0 * PI * py) + torch.cos(2.0 * PI * px) * torch.sin(PI * py)
+        )
+    else:
+        raise ValueError(f"Unsupported load_mode: {load_mode}")
     lmbd, mu = exact_material_torch(x, case_config)
     trace = exx + eyy
     sxx = lmbd * trace + 2.0 * mu * exx
@@ -281,8 +369,8 @@ def exact_state_torch(x, case_config, load_scale=1.0):
     return torch.cat((ux, uy, sxx, syy, sxy, lmbd, mu), dim=1)
 
 
-def exact_body_force_torch(x, case_config, load_scale=1.0):
-    exact_state = exact_state_torch(x, case_config, load_scale=load_scale)
+def exact_body_force_torch(x, case_config, load_scale=1.0, load_mode="legacy"):
+    exact_state = exact_state_torch(x, case_config, load_scale=load_scale, load_mode=load_mode)
     sxx_x = dde.grad.jacobian(exact_state, x, i=2, j=0)
     sxy_y = dde.grad.jacobian(exact_state, x, i=4, j=1)
     sxy_x = dde.grad.jacobian(exact_state, x, i=4, j=0)
@@ -512,13 +600,15 @@ def build_backbone(input_dim, hidden_layers, output_dim, activation="tanh", back
 
 
 class VanillaMaterialFieldNet(dde.nn.pytorch.nn.NN):
-    def __init__(self, hidden_layers, activation="tanh", num_frequencies=0, backbone_type="mlp"):
+    def __init__(self, hidden_layers, activation="tanh", num_frequencies=0, backbone_type="mlp", output_dim=None):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
+        if output_dim is None:
+            output_dim = len(FIELD_NAMES)
         self.backbone = build_backbone(
             input_dim=self.features.output_dim,
             hidden_layers=hidden_layers,
-            output_dim=len(FIELD_NAMES),
+            output_dim=int(output_dim),
             activation=activation,
             backbone_type=backbone_type,
         )
@@ -548,6 +638,7 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         case_name,
         state_hidden_layers,
         interface_hidden_layers,
+        num_loads=1,
         activation="tanh",
         num_frequencies=0,
         lambda_floor=0.1,
@@ -559,6 +650,7 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         self.features = FourierFeatureMap(num_frequencies)
         self.num_regions = num_regions_for_case(case_name)
         self.case_name = case_name
+        self.num_loads = int(num_loads)
         self.lambda_floor = float(lambda_floor)
         self.mu_floor = float(mu_floor)
         self.interface_sharpness = float(interface_sharpness)
@@ -566,7 +658,7 @@ class InterfaceAwareMaterialNetV2(dde.nn.pytorch.nn.NN):
         self.state_net = build_backbone(
             input_dim=feature_dim,
             hidden_layers=state_hidden_layers,
-            output_dim=2,
+            output_dim=2 * self.num_loads,
             activation=activation,
             backbone_type=backbone_type,
         )
@@ -634,6 +726,7 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         self,
         case_name,
         state_hidden_layers,
+        num_loads=1,
         activation="tanh",
         num_frequencies=0,
         lambda_floor=0.1,
@@ -644,6 +737,7 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         super().__init__()
         self.features = FourierFeatureMap(num_frequencies)
         self.case_name = case_name
+        self.num_loads = int(num_loads)
         self.num_regions = num_regions_for_case(case_name)
         self.lambda_floor = float(lambda_floor)
         self.mu_floor = float(mu_floor)
@@ -651,7 +745,7 @@ class GeometryAwareMaterialNet(dde.nn.pytorch.nn.NN):
         self.state_net = build_backbone(
             input_dim=self.features.output_dim,
             hidden_layers=state_hidden_layers,
-            output_dim=2,
+            output_dim=2 * self.num_loads,
             activation=activation,
             backbone_type=backbone_type,
         )
@@ -850,16 +944,13 @@ class SmoothGeometryAwareMaterialNetV3(dde.nn.pytorch.nn.NN):
         return diagnostics
 
 
-def make_output_transform(lambda_floor, mu_floor, method=None):
+def make_output_transform(lambda_floor, mu_floor, method=None, num_loads=1):
     def output_transform(inputs, outputs):
-        ux = outputs[:, 0:1]
-        uy = outputs[:, 1:2]
-        sxx = outputs[:, 2:3]
-        syy = outputs[:, 3:4]
-        sxy = outputs[:, 4:5]
-        lmbd = lambda_floor + F.softplus(outputs[:, 5:6])
-        mu = mu_floor + F.softplus(outputs[:, 6:7])
-        return torch.cat((ux, uy, sxx, syy, sxy, lmbd, mu), dim=1)
+        state_width = 5 * int(max(num_loads, 1))
+        state_outputs = outputs[:, :state_width]
+        lmbd = lambda_floor + F.softplus(outputs[:, state_width:state_width + 1])
+        mu = mu_floor + F.softplus(outputs[:, state_width + 1:state_width + 2])
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
 
     return output_transform
 
@@ -873,11 +964,13 @@ def is_compact_material_method(method):
 
 
 def build_network(args):
+    num_loads = compact_num_loads(args)
     if args.method == "iaminn_v2":
         net = InterfaceAwareMaterialNetV2(
             case_name=args.case,
             state_hidden_layers=parse_hidden_layers(args.state_layers),
             interface_hidden_layers=parse_hidden_layers(args.interface_layers),
+            num_loads=num_loads,
             activation=args.activation,
             num_frequencies=args.num_frequencies,
             lambda_floor=args.lambda_floor,
@@ -889,6 +982,7 @@ def build_network(args):
         net = GeometryAwareMaterialNet(
             case_name=args.case,
             state_hidden_layers=parse_hidden_layers(args.state_layers),
+            num_loads=num_loads,
             activation=args.activation,
             num_frequencies=args.num_frequencies,
             lambda_floor=args.lambda_floor,
@@ -913,25 +1007,32 @@ def build_network(args):
     else:
         net = VanillaMaterialFieldNet(
             hidden_layers=parse_hidden_layers(args.hidden_layers),
+            output_dim=5 * num_loads + 2,
             activation=args.activation,
             num_frequencies=args.num_frequencies,
             backbone_type=args.backbone_type,
         )
-        net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method))
+        net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method, num_loads=num_loads))
     return net
 
 
 
-def build_pde(case_config, reg_weight, method=None, load_scales=None):
+def build_pde(case_config, reg_weight, method=None, load_scales=None, load_modes=None):
     def pde(x, y):
+        load_specs = resolve_load_specs(
+            load_scales if load_scales is not None else "1.0",
+            load_modes if load_modes is not None else "",
+        )
+        num_loads = len(load_specs)
         if is_compact_material_method(method):
-            compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
-            lambda_idx = 2 * len(compact_load_scales)
+            lambda_idx = 2 * num_loads
             mu_idx = lambda_idx + 1
             lmbd = y[:, lambda_idx:lambda_idx + 1]
             mu = y[:, mu_idx:mu_idx + 1]
             residuals = []
-            for load_index, load_scale in enumerate(compact_load_scales):
+            for load_index, load_spec in enumerate(load_specs):
+                load_scale = float(load_spec["scale"])
+                load_mode = str(load_spec["mode"])
                 ux = y[:, 2 * load_index : 2 * load_index + 1]
                 uy = y[:, 2 * load_index + 1 : 2 * load_index + 2]
                 ux_x = dde.grad.jacobian(ux, x, i=0, j=0)
@@ -948,7 +1049,7 @@ def build_pde(case_config, reg_weight, method=None, load_scales=None):
                 syy_y = dde.grad.jacobian(constitutive_syy, x, i=0, j=1)
                 sxy_x = dde.grad.jacobian(constitutive_sxy, x, i=0, j=0)
                 sxy_y = dde.grad.jacobian(constitutive_sxy, x, i=0, j=1)
-                fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale)
+                fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale, load_mode=load_mode)
                 residuals.extend(
                     [
                         sxx_x + sxy_y + fx,
@@ -966,38 +1067,45 @@ def build_pde(case_config, reg_weight, method=None, load_scales=None):
                 )
             return residuals
 
-        ux_x = dde.grad.jacobian(y, x, i=0, j=0)
-        ux_y = dde.grad.jacobian(y, x, i=0, j=1)
-        uy_x = dde.grad.jacobian(y, x, i=1, j=0)
-        uy_y = dde.grad.jacobian(y, x, i=1, j=1)
-        exx = ux_x
-        eyy = uy_y
-        exy = 0.5 * (ux_y + uy_x)
-        lambda_idx, mu_idx = 5, 6
+        lambda_idx, mu_idx = 5 * num_loads, 5 * num_loads + 1
         lmbd = y[:, lambda_idx:lambda_idx + 1]
         mu = y[:, mu_idx:mu_idx + 1]
+        residuals = []
+        for load_index, load_spec in enumerate(load_specs):
+            load_scale = float(load_spec["scale"])
+            load_mode = str(load_spec["mode"])
+            offset = 5 * load_index
+            ux = y[:, offset:offset + 1]
+            uy = y[:, offset + 1:offset + 2]
+            sxx = y[:, offset + 2:offset + 3]
+            syy = y[:, offset + 3:offset + 4]
+            sxy = y[:, offset + 4:offset + 5]
 
-        constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
-        constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
-        constitutive_sxy = 2.0 * mu * exy
+            ux_x = dde.grad.jacobian(ux, x, i=0, j=0)
+            ux_y = dde.grad.jacobian(ux, x, i=0, j=1)
+            uy_x = dde.grad.jacobian(uy, x, i=0, j=0)
+            uy_y = dde.grad.jacobian(uy, x, i=0, j=1)
+            exx = ux_x
+            eyy = uy_y
+            exy = 0.5 * (ux_y + uy_x)
+            constitutive_sxx = lmbd * (exx + eyy) + 2.0 * mu * exx
+            constitutive_syy = lmbd * (exx + eyy) + 2.0 * mu * eyy
+            constitutive_sxy = 2.0 * mu * exy
 
-        sxx = y[:, 2:3]
-        syy = y[:, 3:4]
-        sxy = y[:, 4:5]
-
-        sxx_x = dde.grad.jacobian(sxx, x, i=0, j=0)
-        syy_y = dde.grad.jacobian(syy, x, i=0, j=1)
-        sxy_x = dde.grad.jacobian(sxy, x, i=0, j=0)
-        sxy_y = dde.grad.jacobian(sxy, x, i=0, j=1)
-
-        fx, fy = exact_body_force_torch(x, case_config, load_scale=1.0)
-        residuals = [
-            sxx_x + sxy_y + fx,
-            sxy_x + syy_y + fy,
-            y[:, 2:3] - constitutive_sxx,
-            y[:, 3:4] - constitutive_syy,
-            y[:, 4:5] - constitutive_sxy,
-        ]
+            sxx_x = dde.grad.jacobian(sxx, x, i=0, j=0)
+            syy_y = dde.grad.jacobian(syy, x, i=0, j=1)
+            sxy_x = dde.grad.jacobian(sxy, x, i=0, j=0)
+            sxy_y = dde.grad.jacobian(sxy, x, i=0, j=1)
+            fx, fy = exact_body_force_torch(x, case_config, load_scale=load_scale, load_mode=load_mode)
+            residuals.extend(
+                [
+                    sxx_x + sxy_y + fx,
+                    sxy_x + syy_y + fy,
+                    sxx - constitutive_sxx,
+                    syy - constitutive_syy,
+                    sxy - constitutive_sxy,
+                ]
+            )
         if reg_weight > 0.0:
             residuals.extend(
                 [
@@ -1012,27 +1120,48 @@ def build_pde(case_config, reg_weight, method=None, load_scales=None):
     return pde
 
 
-def pde_loss_names(reg_weight, method=None, load_scales=None):
+def pde_loss_names(reg_weight, method=None, load_scales=None, load_modes=None):
+    load_specs = resolve_load_specs(
+        load_scales if load_scales is not None else "1.0",
+        load_modes if load_modes is not None else "",
+    )
     if is_compact_material_method(method):
-        compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
         names = []
-        for load_index in range(len(compact_load_scales)):
+        for load_index in range(len(load_specs)):
             names.extend([f"momentum_x_l{load_index}", f"momentum_y_l{load_index}"])
     else:
-        names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
+        if len(load_specs) == 1:
+            names = ["momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"]
+        else:
+            names = []
+            for load_index in range(len(load_specs)):
+                names.extend(
+                    [
+                        f"momentum_x_l{load_index}",
+                        f"momentum_y_l{load_index}",
+                        f"constitutive_xx_l{load_index}",
+                        f"constitutive_yy_l{load_index}",
+                        f"constitutive_xy_l{load_index}",
+                    ]
+                )
     if reg_weight > 0.0:
         names.extend(["lambda_x", "lambda_y", "mu_x", "mu_y"])
     return names
 
 
-def pde_loss_weights(reg_weight, method=None, load_scales=None):
+def pde_loss_weights(reg_weight, method=None, load_scales=None, load_modes=None):
+    load_specs = resolve_load_specs(
+        load_scales if load_scales is not None else "1.0",
+        load_modes if load_modes is not None else "",
+    )
     if is_compact_material_method(method):
-        compact_load_scales = parse_load_scales(load_scales if load_scales is not None else "1.0")
         weights = []
-        for _ in compact_load_scales:
+        for _ in load_specs:
             weights.extend([1.0, 1.0])
     else:
-        weights = [1.0, 1.0, 1.0, 1.0, 1.0]
+        weights = []
+        for _ in load_specs:
+            weights.extend([1.0, 1.0, 1.0, 1.0, 1.0])
     if reg_weight > 0.0:
         weights.extend([reg_weight, reg_weight, reg_weight, reg_weight])
     return weights
@@ -1046,10 +1175,13 @@ def resolve_loss_weights(
     data_scale=1.0,
 ):
     weights = []
-    for loss_name in pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")):
-        if loss_name in {"momentum_x", "momentum_y", "constitutive_xx", "constitutive_yy", "constitutive_xy"}:
-            weights.append(float(physics_scale))
-        elif loss_name.startswith("momentum_"):
+    for loss_name in pde_loss_names(
+        args.reg_weight,
+        args.method,
+        getattr(args, "load_scales", "1.0"),
+        getattr(args, "load_modes", ""),
+    ):
+        if loss_name.startswith(("momentum_", "constitutive_")):
             weights.append(float(physics_scale))
         else:
             weights.append(float(args.reg_weight) * float(reg_scale))
@@ -1066,7 +1198,7 @@ def resolve_loss_weights(
     return weights
 
 
-def build_observation_payload(points, case_config, noise_level, seed, load_scale=1.0):
+def build_observation_payload(points, case_config, noise_level, seed, load_scale=1.0, load_mode="legacy"):
     if len(points) == 0:
         return {
             "points": np.zeros((0, 2), dtype=float),
@@ -1074,8 +1206,9 @@ def build_observation_payload(points, case_config, noise_level, seed, load_scale
             "noisy": np.zeros((0, 2), dtype=float),
             "true_state": np.zeros((0, len(FIELD_NAMES)), dtype=float),
             "load_scale": float(load_scale),
+            "load_mode": str(load_mode),
         }
-    exact_observation_state = exact_state_numpy(points, case_config, load_scale=load_scale)
+    exact_observation_state = exact_state_numpy(points, case_config, load_scale=load_scale, load_mode=load_mode)
     clean_observation = exact_observation_state[:, :2]
     noisy_observation = add_noise(clean_observation, noise_level, seed)
     return {
@@ -1084,12 +1217,13 @@ def build_observation_payload(points, case_config, noise_level, seed, load_scale
         "noisy": noisy_observation,
         "true_state": exact_observation_state,
         "load_scale": float(load_scale),
+        "load_mode": str(load_mode),
     }
 
 
 def build_data(args, case_config):
     geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
-    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
+    load_specs = resolve_load_specs(getattr(args, "load_scales", "1.0"), getattr(args, "load_modes", ""))
     observation_splits = build_observation_splits(
         num_train=args.num_observe,
         num_val=args.num_val_observe,
@@ -1104,7 +1238,9 @@ def build_data(args, case_config):
     val_observation_loads = []
     eval_observation_loads = []
     boundary_observation_loads = []
-    for load_index, load_scale in enumerate(load_scales):
+    for load_index, load_spec in enumerate(load_specs):
+        load_scale = float(load_spec["scale"])
+        load_mode = str(load_spec["mode"])
         train_observation_loads.append(
             build_observation_payload(
                 observation_splits["train"],
@@ -1112,6 +1248,7 @@ def build_data(args, case_config):
                 args.noise_level,
                 args.seed + 123 + 1000 * load_index,
                 load_scale=load_scale,
+                load_mode=load_mode,
             )
         )
         val_observation_loads.append(
@@ -1121,6 +1258,7 @@ def build_data(args, case_config):
                 args.noise_level,
                 args.seed + 223 + 1000 * load_index,
                 load_scale=load_scale,
+                load_mode=load_mode,
             )
         )
         eval_observation_loads.append(
@@ -1130,6 +1268,7 @@ def build_data(args, case_config):
                 args.noise_level,
                 args.seed + 323 + 1000 * load_index,
                 load_scale=load_scale,
+                load_mode=load_mode,
             )
         )
         boundary_observation_loads.append(
@@ -1139,6 +1278,7 @@ def build_data(args, case_config):
                 0.0,
                 args.seed + 423 + 1000 * load_index,
                 load_scale=load_scale,
+                load_mode=load_mode,
             )
         )
 
@@ -1158,7 +1298,13 @@ def build_data(args, case_config):
         )
     data = dde.data.PDE(
         geom,
-        build_pde(case_config, args.reg_weight, args.method, load_scales=load_scales),
+        build_pde(
+            case_config,
+            args.reg_weight,
+            args.method,
+            load_scales=getattr(args, "load_scales", "1.0"),
+            load_modes=getattr(args, "load_modes", ""),
+        ),
         bcs,
         num_domain=args.num_domain,
         num_boundary=0,
@@ -1174,7 +1320,8 @@ def build_data(args, case_config):
         "train_observation_loads": train_observation_loads,
         "val_observation_loads": val_observation_loads,
         "eval_observation_loads": eval_observation_loads,
-        "load_scales": load_scales,
+        "load_scales": [float(spec["scale"]) for spec in load_specs],
+        "load_modes": [str(spec["mode"]) for spec in load_specs],
         "observation_cache_path": observation_splits.get("cache_path"),
     }
     return geom, data, metadata
@@ -1403,7 +1550,12 @@ def save_training_artifacts(
         "case": asdict(case_config),
         "parameter_count": count_trainable_parameters(net),
         "field_names": FIELD_NAMES,
-        "pde_loss_names": pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+        "pde_loss_names": pde_loss_names(
+            args.reg_weight,
+            args.method,
+            getattr(args, "load_scales", "1.0"),
+            getattr(args, "load_modes", ""),
+        ),
         "bc_loss_names": bc_loss_names,
         "selection_metric": "validation_observation_mse",
         "observation_cache_path": metadata.get("observation_cache_path"),
@@ -1453,7 +1605,14 @@ def save_training_artifacts(
             losshistory,
             save_dir,
             filename="loss_history.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0"))),
+            num_pde_losses=len(
+                pde_loss_names(
+                    args.reg_weight,
+                    args.method,
+                    getattr(args, "load_scales", "1.0"),
+                    getattr(args, "load_modes", ""),
+                )
+            ),
             num_bc_losses=len(bc_loss_names),
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
@@ -1464,9 +1623,21 @@ def save_training_artifacts(
             losshistory,
             save_dir,
             filename="loss_components.png",
-            num_pde_losses=len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0"))),
+            num_pde_losses=len(
+                pde_loss_names(
+                    args.reg_weight,
+                    args.method,
+                    getattr(args, "load_scales", "1.0"),
+                    getattr(args, "load_modes", ""),
+                )
+            ),
             num_bc_losses=len(bc_loss_names),
-            pde_loss_names=pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+            pde_loss_names=pde_loss_names(
+                args.reg_weight,
+                args.method,
+                getattr(args, "load_scales", "1.0"),
+                getattr(args, "load_modes", ""),
+            ),
             bc_loss_names=bc_loss_names,
         )
         save_loss_history_json(losshistory, save_dir, filename="loss_history.json")
@@ -1640,7 +1811,21 @@ def predict_material_diagnostics(model, points, args, batch_size=4096):
 def predict_full_fields(model, points, args, batch_size=4096, load_index=0):
     if is_compact_material_method(args.method):
         return _predict_compact_full_fields(model, points, args, batch_size=batch_size, load_index=load_index)
-    return np.asarray(model.predict(points))
+    raw = np.asarray(model.predict(points))
+    num_loads = compact_num_loads(args)
+    if num_loads <= 1:
+        return raw
+    load_index = int(max(0, min(load_index, num_loads - 1)))
+    offset = 5 * load_index
+    lambda_idx, mu_idx = compact_material_indices(args)
+    return np.concatenate(
+        [
+            raw[:, offset:offset + 5],
+            raw[:, lambda_idx:lambda_idx + 1],
+            raw[:, mu_idx:mu_idx + 1],
+        ],
+        axis=1,
+    )
 
 
 def compute_observation_mse(model, args, observation_points, observation_truth):
@@ -1860,14 +2045,25 @@ def evaluate_model(
 ):
     eval_points, xx, yy = make_grid(args.eval_nx, args.eval_ny)
     primary_load_index = int(getattr(args, "primary_load_index", 0))
-    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
-    primary_scale = load_scales[min(primary_load_index, len(load_scales) - 1)]
-    truth = exact_state_numpy(eval_points, case_config, load_scale=primary_scale)
+    load_specs = resolve_load_specs(getattr(args, "load_scales", "1.0"), getattr(args, "load_modes", ""))
+    primary_spec = load_specs[min(primary_load_index, len(load_specs) - 1)]
+    truth = exact_state_numpy(
+        eval_points,
+        case_config,
+        load_scale=float(primary_spec["scale"]),
+        load_mode=str(primary_spec["mode"]),
+    )
     prediction = predict_full_fields(model, eval_points, args, load_index=primary_load_index)
     residual = split_residual_prediction(
         model.predict(
             eval_points,
-            operator=build_pde(case_config, args.reg_weight, args.method, load_scales=getattr(args, "load_scales", "1.0")),
+            operator=build_pde(
+                case_config,
+                args.reg_weight,
+                args.method,
+                load_scales=getattr(args, "load_scales", "1.0"),
+                load_modes=getattr(args, "load_modes", ""),
+            ),
         )
     )
     observation_prediction = predict_full_fields(model, observation_points, args, load_index=primary_load_index)[:, :2]
@@ -1978,7 +2174,14 @@ def build_model(args, data):
 
 
 def make_callbacks(args, save_dir, metadata):
-    num_pde = len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")))
+    num_pde = len(
+        pde_loss_names(
+            args.reg_weight,
+            args.method,
+            getattr(args, "load_scales", "1.0"),
+            getattr(args, "load_modes", ""),
+        )
+    )
     num_loads = compact_num_loads(args)
     bc_loss_names = []
     for load_index in range(num_loads):
@@ -1998,7 +2201,12 @@ def make_callbacks(args, save_dir, metadata):
             filename="loss_history.png",
             num_pde_losses=num_pde,
             num_bc_losses=len(bc_loss_names),
-            pde_loss_names=pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")),
+            pde_loss_names=pde_loss_names(
+                args.reg_weight,
+                args.method,
+                getattr(args, "load_scales", "1.0"),
+                getattr(args, "load_modes", ""),
+            ),
             bc_loss_names=bc_loss_names,
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
@@ -2066,6 +2274,7 @@ def build_common_parser(description):
     parser.add_argument("--material_parameterization", choices=["bulkmu", "lamemu"], default="bulkmu")
     parser.add_argument("--k_floor", type=float, default=0.2)
     parser.add_argument("--load_scales", type=str, default="1.0")
+    parser.add_argument("--load_modes", type=str, default="")
     parser.add_argument("--primary_load_index", type=int, default=0)
     parser.add_argument("--observation_split_tag", type=str, default="official_softbc_v1")
     parser.add_argument("--observation_cache_dir", type=str, default=DEFAULT_OBSERVATION_CACHE_DIR)
@@ -2087,9 +2296,9 @@ def prepare_run(args):
         raise ValueError("num_eval_observe must be positive for held-out evaluation.")
     if args.num_boundary <= 0:
         raise ValueError("num_boundary must be positive when using unified soft boundary constraints.")
-    load_scales = parse_load_scales(getattr(args, "load_scales", "1.0"))
-    if int(getattr(args, "primary_load_index", 0)) < 0 or int(getattr(args, "primary_load_index", 0)) >= len(load_scales):
-        raise ValueError("primary_load_index is out of range for load_scales.")
+    load_specs = resolve_load_specs(getattr(args, "load_scales", "1.0"), getattr(args, "load_modes", ""))
+    if int(getattr(args, "primary_load_index", 0)) < 0 or int(getattr(args, "primary_load_index", 0)) >= len(load_specs):
+        raise ValueError("primary_load_index is out of range for configured load cases.")
     set_random_seed(args.seed)
     if args.device_debug:
         print_gpu_info()
