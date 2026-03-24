@@ -1947,22 +1947,68 @@ def reshape_grid(values, ny, nx):
 
 
 def plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name):
+    truth_grid = np.asarray(truth_grid)
+    pred_grid = np.asarray(pred_grid)
     abs_error = np.abs(pred_grid - truth_grid)
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
-    titles = [
-        f"True {field_name}",
-        f"Predicted {field_name}",
-        f"Absolute error of {field_name}",
-    ]
-    cmaps = ["viridis", "viridis", "magma"]
-    for axis, grid, title, cmap in zip(axes, [truth_grid, pred_grid, abs_error], titles, cmaps):
-        image = axis.contourf(xx, yy, grid, levels=100, cmap=cmap)
-        axis.set_title(title)
-        axis.set_xlabel("x")
-        axis.set_ylabel("y")
-        axis.set_aspect("equal")
-        plt.colorbar(image, ax=axis)
-    plt.tight_layout()
+
+    truth_min = float(np.nanmin(truth_grid))
+    truth_max = float(np.nanmax(truth_grid))
+    pred_min = float(np.nanmin(pred_grid))
+    pred_max = float(np.nanmax(pred_grid))
+
+    truth_amp = float(max(abs(truth_min), abs(truth_max)))
+    pred_amp = float(max(abs(pred_min), abs(pred_max)))
+    amp = float(max(truth_amp, pred_amp))
+    truth_range = float(truth_max - truth_min)
+
+    near_zero_truth = (truth_amp <= 1e-12) or (amp > 0.0 and truth_amp <= 0.05 * amp) or (truth_range <= 1e-12)
+
+    if near_zero_truth:
+        vmax = amp if amp > 0.0 else 1.0
+        vmin = -vmax
+        title_suffix = f" (shared ±{vmax:.2e})"
+    else:
+        vmin = float(min(truth_min, pred_min))
+        vmax = float(max(truth_max, pred_max))
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = -1.0, 1.0
+        if vmin == vmax:
+            delta = 1.0 if vmin == 0.0 else abs(vmin) * 1e-6
+            vmin -= delta
+            vmax += delta
+        title_suffix = ""
+
+    shared_levels = np.linspace(vmin, vmax, 101)
+
+    err_max = float(np.nanmax(abs_error))
+    if not np.isfinite(err_max) or err_max == 0.0:
+        err_levels = np.linspace(0.0, 1.0, 101)
+    else:
+        err_levels = np.linspace(0.0, err_max, 101)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+
+    im0 = axes[0].contourf(xx, yy, truth_grid, levels=shared_levels, cmap="viridis", vmin=vmin, vmax=vmax)
+    axes[0].set_title(f"True {field_name}{title_suffix}")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+    axes[0].set_aspect("equal")
+
+    im1 = axes[1].contourf(xx, yy, pred_grid, levels=shared_levels, cmap="viridis", vmin=vmin, vmax=vmax)
+    axes[1].set_title(f"Predicted {field_name}{title_suffix}")
+    axes[1].set_xlabel("x")
+    axes[1].set_ylabel("y")
+    axes[1].set_aspect("equal")
+
+    im2 = axes[2].contourf(xx, yy, abs_error, levels=err_levels, cmap="magma")
+    axes[2].set_title(f"Absolute error of {field_name}")
+    axes[2].set_xlabel("x")
+    axes[2].set_ylabel("y")
+    axes[2].set_aspect("equal")
+
+    fig.colorbar(im0, ax=[axes[0], axes[1]])
+    fig.colorbar(im2, ax=axes[2])
+
     plt.savefig(_get_save_path(save_dir, "png", f"{field_name}_comparison.png"), dpi=300)
     plt.close(fig)
 

@@ -96,6 +96,18 @@ def parse_args():
     parser.add_argument("--adaptive_main_data_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_boundary_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_domain_points", type=int, default=2048)
+    parser.add_argument(
+        "--adaptive_main_strategy",
+        type=str,
+        default="val_feedback",
+        choices=["val_feedback", "multiloss", "grad_balance"],
+    )
+    parser.add_argument("--adaptive_main_scale_ema", type=float, default=0.5)
+    parser.add_argument("--adaptive_main_min_data_scale", type=float, default=0.25)
+    parser.add_argument("--adaptive_main_max_data_scale", type=float, default=4.0)
+    parser.add_argument("--adaptive_main_min_boundary_scale", type=float, default=0.25)
+    parser.add_argument("--adaptive_main_max_boundary_scale", type=float, default=4.0)
+    parser.add_argument("--adaptive_main_grad_eps", type=float, default=1e-12)
     parser.add_argument("--main_stage_chunks", type=int, default=1)
     parser.add_argument("--main_stage_physics_scale_start", type=float, default=1.0)
     parser.add_argument("--main_stage_physics_scale_end", type=float, default=1.0)
@@ -186,6 +198,44 @@ def split_iterations(total_iterations, num_chunks):
 
 def linear_schedule_value(start, end, alpha):
     return float(start) + (float(end) - float(start)) * float(alpha)
+
+
+def clamp_float(value, lower, upper):
+    return float(max(float(lower), min(float(upper), float(value))))
+
+
+def propose_scales_from_signals(signals, base_scales, min_scales, max_scales):
+    signal_array = np.asarray(signals, dtype=np.float64)
+    signal_array = np.maximum(signal_array, 1e-12)
+    inv_signal = 1.0 / signal_array
+    inv_sum = float(np.sum(inv_signal))
+    if not np.isfinite(inv_sum) or inv_sum <= 0:
+        return np.asarray(base_scales, dtype=np.float64)
+    shares = inv_signal / inv_sum
+    total_base = float(np.sum(base_scales))
+    proposed = shares * total_base
+    return np.clip(proposed, np.asarray(min_scales, dtype=np.float64), np.asarray(max_scales, dtype=np.float64))
+
+
+def gradient_l2_norm(loss_tensor, parameters, retain_graph, eps=1e-12):
+    if not parameters:
+        return float("nan")
+    grads = torch.autograd.grad(
+        loss_tensor,
+        parameters,
+        retain_graph=retain_graph,
+        create_graph=False,
+        allow_unused=True,
+    )
+    total = None
+    for grad in grads:
+        if grad is None:
+            continue
+        grad_sq = torch.sum(grad.detach() ** 2)
+        total = grad_sq if total is None else (total + grad_sq)
+    if total is None:
+        return float("nan")
+    return float(torch.sqrt(total + float(eps)).detach().cpu().item())
 
 
 def initialize_geometry_parameters(args, net):
@@ -715,21 +765,56 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
     save_array_txt(os.path.join(save_dir, "txt", "adaptive_main_stage_points.txt"), stage_points, "x y")
 
     chunk_sizes = split_iterations(main_iterations, args.adaptive_main_chunks)
+    strategy = str(getattr(args, "adaptive_main_strategy", "val_feedback")).strip().lower()
     physics_scale = float(args.adaptive_main_base_physics_scale)
+    data_scale = float(args.adaptive_main_data_scale)
+    boundary_scale = float(args.adaptive_main_boundary_scale)
+    min_scales = np.array(
+        [
+            float(args.adaptive_main_min_physics_scale),
+            float(args.adaptive_main_min_data_scale),
+            float(args.adaptive_main_min_boundary_scale),
+        ],
+        dtype=np.float64,
+    )
+    max_scales = np.array(
+        [
+            float(args.adaptive_main_max_physics_scale),
+            float(args.adaptive_main_max_data_scale),
+            float(args.adaptive_main_max_boundary_scale),
+        ],
+        dtype=np.float64,
+    )
+    base_scales = np.array(
+        [
+            float(args.adaptive_main_base_physics_scale),
+            float(args.adaptive_main_data_scale),
+            float(args.adaptive_main_boundary_scale),
+        ],
+        dtype=np.float64,
+    )
+    lr_start = float(args.main_stage_lr_start if args.main_stage_lr_start > 0 else args.main_lr)
+    lr_end = float(args.main_stage_lr_end if args.main_stage_lr_end > 0 else lr_start)
+    ema = clamp_float(getattr(args, "adaptive_main_scale_ema", 0.5), 0.0, 1.0)
     best_val = float("inf")
     history_rows = []
     losshistory = None
     train_state = None
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
+        if len(chunk_sizes) == 1:
+            alpha = 1.0
+        else:
+            alpha = float(chunk_idx - 1) / float(len(chunk_sizes) - 1)
+        chunk_lr = linear_schedule_value(lr_start, lr_end, alpha)
         weights = resolve_loss_weights(
             args,
             physics_scale=physics_scale,
             reg_scale=args.adaptive_main_reg_scale,
-            boundary_scale=args.adaptive_main_boundary_scale,
-            data_scale=args.adaptive_main_data_scale,
+            boundary_scale=boundary_scale,
+            data_scale=data_scale,
         )
-        model.compile("adam", lr=args.main_lr, loss_weights=weights)
+        model.compile("adam", lr=chunk_lr, loss_weights=weights)
         callbacks = make_callbacks(args, save_dir, metadata)
         losshistory, train_state = model.train(
             iterations=chunk_iterations,
@@ -741,6 +826,13 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
+        data_mse_t, boundary_mse_t = average_multiload_fit_losses(
+            net,
+            metadata,
+            args,
+            device=next(net.parameters()).device,
+            target_kind="noisy",
+        )
         terms = compute_compact_material_stage_terms(
             net=net,
             domain_points=stage_points,
@@ -749,32 +841,100 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             usage_floor=args.material_stage_usage_floor,
             args=args,
         )
-        physics_mse = float(terms["physics_mse"].detach().cpu().item())
+        physics_mse_t = terms["physics_mse"]
+        physics_mse = float(physics_mse_t.detach().cpu().item())
+        data_mse = float(data_mse_t.detach().cpu().item())
+        boundary_mse = float(boundary_mse_t.detach().cpu().item())
         reg_mse = float(terms["reg_mse"].detach().cpu().item())
-
-        if val_mse < best_val:
-            best_val = val_mse
-            next_physics_scale = min(float(args.adaptive_main_max_physics_scale), physics_scale * float(args.adaptive_main_scale_up))
-            update_reason = "improved_validation"
-        elif val_mse <= best_val * float(args.adaptive_main_obs_guard):
-            next_physics_scale = min(
-                float(args.adaptive_main_max_physics_scale),
-                physics_scale * (1.0 + 0.5 * (float(args.adaptive_main_scale_up) - 1.0)),
+        physics_grad_norm = float("nan")
+        data_grad_norm = float("nan")
+        boundary_grad_norm = float("nan")
+        current_scales = np.array([physics_scale, data_scale, boundary_scale], dtype=np.float64)
+        next_scales = current_scales.copy()
+        if strategy == "val_feedback":
+            if val_mse < best_val:
+                best_val = val_mse
+                next_scales[0] = min(
+                    float(args.adaptive_main_max_physics_scale),
+                    physics_scale * float(args.adaptive_main_scale_up),
+                )
+                update_reason = "improved_validation"
+            elif val_mse <= best_val * float(args.adaptive_main_obs_guard):
+                next_scales[0] = min(
+                    float(args.adaptive_main_max_physics_scale),
+                    physics_scale * (1.0 + 0.5 * (float(args.adaptive_main_scale_up) - 1.0)),
+                )
+                update_reason = "within_guard"
+            else:
+                next_scales[0] = max(
+                    float(args.adaptive_main_min_physics_scale),
+                    physics_scale * float(args.adaptive_main_scale_down),
+                )
+                update_reason = "validation_regression"
+        elif strategy == "multiloss":
+            signal_vector = np.array([physics_mse, data_mse, boundary_mse], dtype=np.float64)
+            proposed_scales = propose_scales_from_signals(signal_vector, base_scales, min_scales, max_scales)
+            next_scales = (1.0 - ema) * current_scales + ema * proposed_scales
+            next_scales = np.clip(next_scales, min_scales, max_scales)
+            best_val = min(best_val, val_mse)
+            update_reason = "multiloss_inverse_signal"
+        elif strategy == "grad_balance":
+            trainable_params = [parameter for parameter in net.parameters() if parameter.requires_grad]
+            grad_eps = float(getattr(args, "adaptive_main_grad_eps", 1e-12))
+            physics_grad_norm = gradient_l2_norm(
+                physics_mse_t,
+                trainable_params,
+                retain_graph=True,
+                eps=grad_eps,
             )
-            update_reason = "within_guard"
+            data_grad_norm = gradient_l2_norm(
+                data_mse_t,
+                trainable_params,
+                retain_graph=True,
+                eps=grad_eps,
+            )
+            boundary_grad_norm = gradient_l2_norm(
+                boundary_mse_t,
+                trainable_params,
+                retain_graph=False,
+                eps=grad_eps,
+            )
+            grad_vector = np.array([physics_grad_norm, data_grad_norm, boundary_grad_norm], dtype=np.float64)
+            if np.any(~np.isfinite(grad_vector)):
+                signal_vector = np.array([physics_mse, data_mse, boundary_mse], dtype=np.float64)
+                proposed_scales = propose_scales_from_signals(signal_vector, base_scales, min_scales, max_scales)
+                update_reason = "grad_balance_fallback_to_loss"
+            else:
+                proposed_scales = propose_scales_from_signals(grad_vector, base_scales, min_scales, max_scales)
+                update_reason = "grad_balance_inverse_norm"
+            next_scales = (1.0 - ema) * current_scales + ema * proposed_scales
+            next_scales = np.clip(next_scales, min_scales, max_scales)
+            best_val = min(best_val, val_mse)
         else:
-            next_physics_scale = max(float(args.adaptive_main_min_physics_scale), physics_scale * float(args.adaptive_main_scale_down))
-            update_reason = "validation_regression"
+            raise ValueError(f"Unsupported adaptive_main_strategy: {strategy}")
+        next_scales = np.clip(next_scales, min_scales, max_scales)
+        next_physics_scale, next_data_scale, next_boundary_scale = [float(v) for v in next_scales]
 
         row = {
             "chunk": int(chunk_idx),
             "chunk_iterations": int(chunk_iterations),
+            "strategy": strategy,
+            "lr": float(chunk_lr),
             "physics_scale_before": float(physics_scale),
             "physics_scale_after": float(next_physics_scale),
+            "data_scale_before": float(data_scale),
+            "data_scale_after": float(next_data_scale),
+            "boundary_scale_before": float(boundary_scale),
+            "boundary_scale_after": float(next_boundary_scale),
             "validation_selection_mse": float(val_mse),
             "best_validation_selection_mse": float(best_val),
             "physics_mse": physics_mse,
+            "data_mse": data_mse,
+            "boundary_mse": boundary_mse,
             "reg_mse": reg_mse,
+            "physics_grad_norm": float(physics_grad_norm),
+            "data_grad_norm": float(data_grad_norm),
+            "boundary_grad_norm": float(boundary_grad_norm),
             "mean_class_probs": [float(v) for v in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(v) for v in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(v) for v in terms["mu_regions"].detach().cpu().numpy().tolist()],
@@ -784,30 +944,51 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             row[key] = float(value.detach().cpu().item())
         history_rows.append(row)
         print(
-            "[adaptive_main] chunk={} iters={} val={:.4e} physics_mse={:.4e} scale={:.4f}->{:.4f} reason={}".format(
+            "[adaptive_main] chunk={} iters={} strategy={} val={:.4e} phys={:.4e} data={:.4e} bc={:.4e} "
+            "scales(p,d,b)=({:.4f},{:.4f},{:.4f})->({:.4f},{:.4f},{:.4f}) reason={}".format(
                 row["chunk"],
                 row["chunk_iterations"],
+                row["strategy"],
                 row["validation_selection_mse"],
                 row["physics_mse"],
+                row["data_mse"],
+                row["boundary_mse"],
                 row["physics_scale_before"],
+                row["data_scale_before"],
+                row["boundary_scale_before"],
                 row["physics_scale_after"],
+                row["data_scale_after"],
+                row["boundary_scale_after"],
                 row["update_reason"],
             )
         )
         physics_scale = next_physics_scale
+        data_scale = next_data_scale
+        boundary_scale = next_boundary_scale
 
     payload = {
         "stage_name": "adaptive_main_stage",
+        "strategy": strategy,
         "chunks": history_rows,
         "base_physics_scale": float(args.adaptive_main_base_physics_scale),
         "min_physics_scale": float(args.adaptive_main_min_physics_scale),
         "max_physics_scale": float(args.adaptive_main_max_physics_scale),
+        "base_data_scale": float(args.adaptive_main_data_scale),
+        "min_data_scale": float(args.adaptive_main_min_data_scale),
+        "max_data_scale": float(args.adaptive_main_max_data_scale),
+        "base_boundary_scale": float(args.adaptive_main_boundary_scale),
+        "min_boundary_scale": float(args.adaptive_main_min_boundary_scale),
+        "max_boundary_scale": float(args.adaptive_main_max_boundary_scale),
         "scale_up": float(args.adaptive_main_scale_up),
         "scale_down": float(args.adaptive_main_scale_down),
+        "scale_ema": float(ema),
+        "lr_start": float(lr_start),
+        "lr_end": float(lr_end),
         "obs_guard": float(args.adaptive_main_obs_guard),
         "reg_scale": float(args.adaptive_main_reg_scale),
-        "data_scale": float(args.adaptive_main_data_scale),
-        "boundary_scale": float(args.adaptive_main_boundary_scale),
+        "final_physics_scale": float(physics_scale),
+        "final_data_scale": float(data_scale),
+        "final_boundary_scale": float(boundary_scale),
         "domain_points": int(len(stage_points)),
     }
     save_json(os.path.join(save_dir, "json", "adaptive_main_stage_history.json"), payload)
@@ -914,6 +1095,13 @@ def main():
                     "adaptive_main_reg_scale": args.adaptive_main_reg_scale,
                     "adaptive_main_data_scale": args.adaptive_main_data_scale,
                     "adaptive_main_boundary_scale": args.adaptive_main_boundary_scale,
+                    "adaptive_main_strategy": args.adaptive_main_strategy,
+                    "adaptive_main_scale_ema": args.adaptive_main_scale_ema,
+                    "adaptive_main_min_data_scale": args.adaptive_main_min_data_scale,
+                    "adaptive_main_max_data_scale": args.adaptive_main_max_data_scale,
+                    "adaptive_main_min_boundary_scale": args.adaptive_main_min_boundary_scale,
+                    "adaptive_main_max_boundary_scale": args.adaptive_main_max_boundary_scale,
+                    "adaptive_main_grad_eps": args.adaptive_main_grad_eps,
                     "main_stage_physics_scale_start": args.main_stage_physics_scale_start,
                     "main_stage_physics_scale_end": args.main_stage_physics_scale_end,
                     "main_stage_reg_scale_start": args.main_stage_reg_scale_start,
