@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument("--layer_y_init", type=float, default=-1.0)
     parser.add_argument("--freeze_geometry_material_stage", action="store_true")
     parser.add_argument("--freeze_geometry_main", action="store_true")
+    parser.add_argument("--main_stage_freeze_geometry_chunks", type=int, default=0)
     parser.add_argument("--material_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--main_stage_interface_sharpness", type=float, default=-1.0)
     parser.add_argument("--freeze_state_material_stage", action="store_true")
@@ -137,7 +138,7 @@ def set_material_branch_trainable(net, trainable):
 
 
 def set_geometry_branch_trainable(net, trainable):
-    geometry_prefixes = ("raw_layer_y", "raw_circle_")
+    geometry_prefixes = ("raw_layer_y", "raw_circle_", "geometry_net.")
     for name, parameter in net.named_parameters():
         if name.startswith(geometry_prefixes):
             parameter.requires_grad = bool(trainable)
@@ -198,6 +199,15 @@ def split_iterations(total_iterations, num_chunks):
 
 def linear_schedule_value(start, end, alpha):
     return float(start) + (float(end) - float(start)) * float(alpha)
+
+
+def configure_main_geometry_trainable(net, args, chunk_idx):
+    freeze_all = bool(getattr(args, "freeze_geometry_main", False))
+    freeze_chunks = max(int(getattr(args, "main_stage_freeze_geometry_chunks", 0)), 0)
+    freeze_geometry = freeze_all or (freeze_chunks > 0 and int(chunk_idx) <= freeze_chunks)
+    set_geometry_branch_trainable(net, not freeze_geometry)
+    set_region_parameter_trainable(net, True)
+    return freeze_geometry
 
 
 def clamp_float(value, lower, upper):
@@ -690,6 +700,7 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     diag_device = next(net.parameters()).device
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
+        geometry_frozen = configure_main_geometry_trainable(net, args, chunk_idx)
         if len(chunk_sizes) == 1:
             alpha = 1.0
         else:
@@ -740,6 +751,7 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
                 "chunk": int(chunk_idx),
                 "chunk_iterations": int(chunk_iterations),
                 "global_step": int(current_step),
+                "geometry_frozen": bool(geometry_frozen),
                 "lr": float(lr),
                 "physics_scale": float(physics_scale),
                 "reg_scale": float(reg_scale),
@@ -769,6 +781,8 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     }
     save_json(os.path.join(save_dir, "json", "main_stage_schedule.json"), payload)
     save_text(os.path.join(save_dir, "txt", "main_stage_schedule.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
+    set_geometry_branch_trainable(net, True)
+    set_region_parameter_trainable(net, True)
     return losshistory, train_state
 
 
@@ -830,6 +844,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
     )
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
+        geometry_frozen = configure_main_geometry_trainable(net, args, chunk_idx)
         if len(chunk_sizes) == 1:
             alpha = 1.0
         else:
@@ -948,6 +963,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             "chunk": int(chunk_idx),
             "chunk_iterations": int(chunk_iterations),
             "global_step": int(current_step),
+            "geometry_frozen": bool(geometry_frozen),
             "strategy": strategy,
             "lr": float(chunk_lr),
             "physics_scale_before": float(physics_scale),
@@ -1023,6 +1039,8 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
     }
     save_json(os.path.join(save_dir, "json", "adaptive_main_stage_history.json"), payload)
     save_text(os.path.join(save_dir, "txt", "adaptive_main_stage_history.txt"), json.dumps(payload, indent=2, ensure_ascii=False))
+    set_geometry_branch_trainable(net, True)
+    set_region_parameter_trainable(net, True)
     return losshistory, train_state
 
 
@@ -1104,6 +1122,7 @@ def main():
                     "layer_y_init": args.layer_y_init,
                     "freeze_geometry_material_stage": args.freeze_geometry_material_stage,
                     "freeze_geometry_main": args.freeze_geometry_main,
+                    "main_stage_freeze_geometry_chunks": args.main_stage_freeze_geometry_chunks,
                     "material_stage_interface_sharpness": args.material_stage_interface_sharpness,
                     "main_stage_interface_sharpness": args.main_stage_interface_sharpness,
                     "freeze_state_material_stage": args.freeze_state_material_stage,
@@ -1157,9 +1176,6 @@ def main():
         material_stage_payload = run_material_stage(args, net, geom, data, case_config, args.save_dir)
         if material_stage_payload is not None:
             print("[material_stage] completed with best total loss {:.4e}".format(material_stage_payload["best"]["total_loss"]))
-        if args.freeze_geometry_main:
-            set_geometry_branch_trainable(net, False)
-            set_region_parameter_trainable(net, True)
         original_sharpness = getattr(net, 'interface_sharpness', None)
         if hasattr(net, 'interface_sharpness') and args.main_stage_interface_sharpness > 0:
             net.interface_sharpness = float(args.main_stage_interface_sharpness)
