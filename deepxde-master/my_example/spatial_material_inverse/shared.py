@@ -1956,29 +1956,17 @@ def plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name):
     pred_min = float(np.nanmin(pred_grid))
     pred_max = float(np.nanmax(pred_grid))
 
-    truth_amp = float(max(abs(truth_min), abs(truth_max)))
-    pred_amp = float(max(abs(pred_min), abs(pred_max)))
-    amp = float(max(truth_amp, pred_amp))
-    truth_range = float(truth_max - truth_min)
-
-    near_zero_truth = (truth_amp <= 1e-12) or (amp > 0.0 and truth_amp <= 0.05 * amp) or (truth_range <= 1e-12)
-
-    if near_zero_truth:
-        vmax = amp if amp > 0.0 else 1.0
-        vmin = -vmax
-        title_suffix = f" (shared ±{vmax:.2e})"
-    else:
-        vmin = float(min(truth_min, pred_min))
-        vmax = float(max(truth_max, pred_max))
+    def get_levels(vmin, vmax):
         if not np.isfinite(vmin) or not np.isfinite(vmax):
             vmin, vmax = -1.0, 1.0
         if vmin == vmax:
             delta = 1.0 if vmin == 0.0 else abs(vmin) * 1e-6
             vmin -= delta
             vmax += delta
-        title_suffix = ""
+        return vmin, vmax, np.linspace(vmin, vmax, 101)
 
-    shared_levels = np.linspace(vmin, vmax, 101)
+    truth_vmin, truth_vmax, truth_levels = get_levels(truth_min, truth_max)
+    pred_vmin, pred_vmax, pred_levels = get_levels(pred_min, pred_max)
 
     err_max = float(np.nanmax(abs_error))
     if not np.isfinite(err_max) or err_max == 0.0:
@@ -1986,27 +1974,27 @@ def plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name):
     else:
         err_levels = np.linspace(0.0, err_max, 101)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.5), constrained_layout=True)
 
-    im0 = axes[0].contourf(xx, yy, truth_grid, levels=shared_levels, cmap="viridis", vmin=vmin, vmax=vmax)
-    axes[0].set_title(f"True {field_name}{title_suffix}")
+    im0 = axes[0].contourf(xx, yy, truth_grid, levels=truth_levels, cmap="viridis", vmin=truth_vmin, vmax=truth_vmax)
+    axes[0].set_title(f"True {field_name}")
     axes[0].set_xlabel("x")
     axes[0].set_ylabel("y")
     axes[0].set_aspect("equal")
+    fig.colorbar(im0, ax=axes[0])
 
-    im1 = axes[1].contourf(xx, yy, pred_grid, levels=shared_levels, cmap="viridis", vmin=vmin, vmax=vmax)
-    axes[1].set_title(f"Predicted {field_name}{title_suffix}")
+    im1 = axes[1].contourf(xx, yy, pred_grid, levels=pred_levels, cmap="viridis", vmin=pred_vmin, vmax=pred_vmax)
+    axes[1].set_title(f"Predicted {field_name}")
     axes[1].set_xlabel("x")
     axes[1].set_ylabel("y")
     axes[1].set_aspect("equal")
+    fig.colorbar(im1, ax=axes[1])
 
     im2 = axes[2].contourf(xx, yy, abs_error, levels=err_levels, cmap="magma")
     axes[2].set_title(f"Absolute error of {field_name}")
     axes[2].set_xlabel("x")
     axes[2].set_ylabel("y")
     axes[2].set_aspect("equal")
-
-    fig.colorbar(im0, ax=[axes[0], axes[1]])
     fig.colorbar(im2, ax=axes[2])
 
     plt.savefig(_get_save_path(save_dir, "png", f"{field_name}_comparison.png"), dpi=300)
@@ -2015,16 +2003,20 @@ def plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name):
 
 def plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name):
     fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-    levels = np.linspace(
-        min(np.min(truth_grid), np.min(pred_grid)),
-        max(np.max(truth_grid), np.max(pred_grid)),
-        24,
-    )
     for axis, grid, title in zip(
         axes,
         [truth_grid, pred_grid],
         [f"True {field_name}", f"Predicted {field_name}"],
     ):
+        vmin, vmax = float(np.min(grid)), float(np.max(grid))
+        if not np.isfinite(vmin) or not np.isfinite(vmax):
+            vmin, vmax = -1.0, 1.0
+        if vmin == vmax:
+            delta = 1.0 if vmin == 0.0 else abs(vmin) * 1e-6
+            vmin -= delta
+            vmax += delta
+        levels = np.linspace(vmin, vmax, 24)
+        
         image = axis.contourf(xx, yy, grid, levels=levels, cmap="viridis")
         axis.contour(xx, yy, grid, levels=levels[::3], colors="white", linewidths=0.5)
         axis.set_title(title)
