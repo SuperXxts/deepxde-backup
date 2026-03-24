@@ -38,6 +38,7 @@ from utils.progress_callback import TqdmProgressCallback
 from utils.save_results import (
     plot_all_loss_components,
     plot_and_save_loss_history,
+    plot_region_parameter_evolution,
     save_best_test_loss_json,
     save_loss_history_json,
 )
@@ -1534,6 +1535,7 @@ def save_training_artifacts(
     metadata,
     net,
 ):
+    region_payload = None
     num_loads = compact_num_loads(args)
     bc_loss_names = []
     for load_index in range(num_loads):
@@ -1671,6 +1673,14 @@ def save_training_artifacts(
                 region_payload[key] = float(value.detach().cpu().item())
         save_json(_get_save_path(save_dir, "json", "material_region_parameters.json"), region_payload)
         save_metrics_text(_get_save_path(save_dir, "txt", "material_region_parameters.txt"), region_payload)
+
+    if region_payload is not None:
+        plot_region_parameter_evolution(
+            save_dir=save_dir,
+            case_config=case_config,
+            total_iterations=int(getattr(args, "iterations", 0)),
+            final_region_payload=region_payload,
+        )
 
 
 def latest_model_prefix(model_dir, prefix_name):

@@ -682,6 +682,12 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     boundary_end = float(args.main_stage_boundary_scale_end)
     lr_start = float(args.main_stage_lr_start if args.main_stage_lr_start > 0 else args.main_lr)
     lr_end = float(args.main_stage_lr_end if args.main_stage_lr_end > 0 else lr_start)
+    current_step = int(
+        max(getattr(args, "warmup_iterations", 0), 0)
+        + max(getattr(args, "geometry_stage_iterations", 0), 0)
+        + max(getattr(args, "material_stage_iterations", 0), 0)
+    )
+    diag_device = next(net.parameters()).device
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
         if len(chunk_sizes) == 1:
@@ -714,16 +720,33 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
+        current_step += int(chunk_iterations)
+        region_summary = {}
+        if hasattr(net, "predict_material_diagnostics"):
+            with torch.no_grad():
+                diagnostics = net.predict_material_diagnostics(
+                    torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=diag_device)
+                )
+            if "lambda_regions" in diagnostics:
+                region_summary["lambda_regions"] = [
+                    float(value) for value in diagnostics["lambda_regions"].detach().cpu().numpy().tolist()
+                ]
+            if "mu_regions" in diagnostics:
+                region_summary["mu_regions"] = [
+                    float(value) for value in diagnostics["mu_regions"].detach().cpu().numpy().tolist()
+                ]
         schedule_rows.append(
             {
                 "chunk": int(chunk_idx),
                 "chunk_iterations": int(chunk_iterations),
+                "global_step": int(current_step),
                 "lr": float(lr),
                 "physics_scale": float(physics_scale),
                 "reg_scale": float(reg_scale),
                 "data_scale": float(data_scale),
                 "boundary_scale": float(boundary_scale),
                 "validation_observation_mse": float(val_mse),
+                **region_summary,
             }
         )
 
@@ -800,6 +823,11 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
     history_rows = []
     losshistory = None
     train_state = None
+    current_step = int(
+        max(getattr(args, "warmup_iterations", 0), 0)
+        + max(getattr(args, "geometry_stage_iterations", 0), 0)
+        + max(getattr(args, "material_stage_iterations", 0), 0)
+    )
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
         if len(chunk_sizes) == 1:
@@ -826,6 +854,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
+        current_step += int(chunk_iterations)
         data_mse_t, boundary_mse_t = average_multiload_fit_losses(
             net,
             metadata,
@@ -918,6 +947,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
         row = {
             "chunk": int(chunk_idx),
             "chunk_iterations": int(chunk_iterations),
+            "global_step": int(current_step),
             "strategy": strategy,
             "lr": float(chunk_lr),
             "physics_scale_before": float(physics_scale),

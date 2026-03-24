@@ -218,6 +218,180 @@ def plot_all_loss_components(losshistory, save_dir, filename="所有损失项详
     plt.savefig(save_path, dpi=300)
     plt.close()
 
+
+def _extract_true_region_constants(case_config, num_regions):
+    if case_config is None or num_regions <= 0:
+        return [], []
+
+    lambda_truths = [float(case_config.lambda_bg)]
+    mu_truths = [float(case_config.mu_bg)]
+
+    if num_regions >= 2:
+        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_1))
+        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_1))
+    if num_regions >= 3:
+        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_2))
+        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_2))
+
+    return lambda_truths[:num_regions], mu_truths[:num_regions]
+
+
+def _append_region_history(records, history_rows, step_offset=0, running_step=None):
+    current_step = int(running_step if running_step is not None else step_offset)
+    for row in history_rows:
+        lambda_regions = row.get("lambda_regions")
+        mu_regions = row.get("mu_regions")
+        if not isinstance(lambda_regions, list) or not isinstance(mu_regions, list):
+            continue
+        if len(lambda_regions) == 0 or len(lambda_regions) != len(mu_regions):
+            continue
+
+        if row.get("global_step") is not None:
+            step = int(row["global_step"])
+            current_step = step
+        elif row.get("step") is not None:
+            step = int(step_offset) + int(row["step"])
+            current_step = step
+        elif row.get("chunk_iterations") is not None:
+            current_step += int(row["chunk_iterations"])
+            step = current_step
+        else:
+            continue
+
+        records.append(
+            {
+                "step": step,
+                "lambda_regions": [float(value) for value in lambda_regions],
+                "mu_regions": [float(value) for value in mu_regions],
+            }
+        )
+    return current_step
+
+
+def plot_region_parameter_evolution(
+    save_dir,
+    case_config,
+    total_iterations=None,
+    final_region_payload=None,
+    filename="region_parameter_evolution.png",
+    json_filename="region_parameter_evolution.json",
+):
+    plan_path = _get_save_path(save_dir, "json", "stage_training_plan.json")
+    geometry_path = _get_save_path(save_dir, "json", "geometry_stage_history.json")
+    material_path = _get_save_path(save_dir, "json", "material_stage_history.json")
+    adaptive_main_path = _get_save_path(save_dir, "json", "adaptive_main_stage_history.json")
+    main_schedule_path = _get_save_path(save_dir, "json", "main_stage_schedule.json")
+    output_json_path = _get_save_path(save_dir, "json", json_filename)
+    output_png_path = _get_save_path(save_dir, "png", filename)
+
+    plan = {}
+    if os.path.isfile(plan_path):
+        with open(plan_path, "r", encoding="utf-8") as handle:
+            plan = json.load(handle)
+
+    warmup_iterations = int(plan.get("warmup_iterations", 0))
+    geometry_iterations = int(plan.get("geometry_stage_iterations", 0))
+    material_iterations = int(plan.get("material_stage_iterations", 0))
+    refinement_iterations = int(plan.get("refinement_stage_iterations", 0))
+    if total_iterations is None:
+        total_iterations = int(
+            warmup_iterations
+            + geometry_iterations
+            + material_iterations
+            + int(plan.get("main_iterations", 0))
+            + refinement_iterations
+        )
+
+    records = []
+
+    if os.path.isfile(geometry_path):
+        with open(geometry_path, "r", encoding="utf-8") as handle:
+            geometry_payload = json.load(handle)
+        _append_region_history(records, geometry_payload.get("history", []), step_offset=warmup_iterations)
+
+    material_offset = warmup_iterations + geometry_iterations
+    if os.path.isfile(material_path):
+        with open(material_path, "r", encoding="utf-8") as handle:
+            material_payload = json.load(handle)
+        _append_region_history(records, material_payload.get("history", []), step_offset=material_offset)
+
+    main_offset = warmup_iterations + geometry_iterations + material_iterations
+    if os.path.isfile(adaptive_main_path):
+        with open(adaptive_main_path, "r", encoding="utf-8") as handle:
+            adaptive_payload = json.load(handle)
+        _append_region_history(records, adaptive_payload.get("chunks", []), step_offset=main_offset, running_step=main_offset)
+    elif os.path.isfile(main_schedule_path):
+        with open(main_schedule_path, "r", encoding="utf-8") as handle:
+            main_payload = json.load(handle)
+        _append_region_history(records, main_payload.get("history", []), step_offset=main_offset, running_step=main_offset)
+
+    if final_region_payload is not None:
+        lambda_regions = final_region_payload.get("lambda_regions")
+        mu_regions = final_region_payload.get("mu_regions")
+        if isinstance(lambda_regions, list) and isinstance(mu_regions, list) and len(lambda_regions) == len(mu_regions):
+            records.append(
+                {
+                    "step": int(total_iterations),
+                    "lambda_regions": [float(value) for value in lambda_regions],
+                    "mu_regions": [float(value) for value in mu_regions],
+                }
+            )
+
+    if not records:
+        return None
+
+    unique_records = {}
+    for row in records:
+        unique_records[int(row["step"])] = row
+    records = [unique_records[key] for key in sorted(unique_records)]
+
+    num_regions = len(records[-1]["lambda_regions"])
+    lambda_truths, mu_truths = _extract_true_region_constants(case_config, num_regions)
+    steps = [int(row["step"]) for row in records]
+    lambda_matrix = np.asarray([row["lambda_regions"] for row in records], dtype=float)
+    mu_matrix = np.asarray([row["mu_regions"] for row in records], dtype=float)
+
+    payload = {
+        "steps": steps,
+        "lambda_regions": lambda_matrix.tolist(),
+        "mu_regions": mu_matrix.tolist(),
+        "lambda_truths": lambda_truths,
+        "mu_truths": mu_truths,
+    }
+    with open(output_json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4", "#ff7f0e", "#2ca02c"])
+
+    for axis, matrix, truths, field_name in zip(
+        axes,
+        [lambda_matrix, mu_matrix],
+        [lambda_truths, mu_truths],
+        ["Lambda", "Mu"],
+    ):
+        for index in range(matrix.shape[1]):
+            color = colors[index % len(colors)]
+            axis.plot(steps, matrix[:, index], color=color, linewidth=2.0, label=f"pred_r{index}")
+            if index < len(truths):
+                axis.axhline(truths[index], color=color, linestyle="--", linewidth=1.6, alpha=0.85, label=f"true_r{index}")
+        axis.set_title(f"{field_name} Regions vs Step")
+        axis.set_xlabel("Step")
+        axis.set_ylabel(field_name)
+        axis.grid(True, alpha=0.25)
+        axis.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.18),
+            ncol=2,
+            fontsize=8,
+            frameon=False,
+        )
+
+    plt.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    plt.savefig(output_png_path, dpi=300)
+    plt.close(fig)
+    return payload
+
 def save_model_checkpoint(model, save_dir, filename="model.ckpt"):
     """
     保存模型检查点
