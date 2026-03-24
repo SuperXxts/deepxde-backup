@@ -23,7 +23,7 @@ launch_one() {
   local extra_args="$4"
   local run_dir="$ROOT/exp/${EXP_GROUP}/${CASE_NAME}/${run_name}"
   local screen_name="codex260320_${run_name}"
-  local cmd="source /public/home/xinxi/wxtian/anaconda3/bin/activate pytorch2.1w2 && export CUDA_VISIBLE_DEVICES=${dcu} && cd ${WORK} && python -c 'import os, torch; print(\"cuda_available\", torch.cuda.is_available(), \"device_count\", torch.cuda.device_count(), \"visible\", os.environ.get(\"CUDA_VISIBLE_DEVICES\"))' && python train_material_field.py ${COMMON_ARGS} --run_name ${run_name} ${extra_args}"
+  local cmd="source /public/home/xinxi/wxtian/anaconda3/bin/activate pytorch2.1w2 && export CUDA_VISIBLE_DEVICES=${dcu} && echo CUDA_VISIBLE_DEVICES=\$CUDA_VISIBLE_DEVICES && cd ${WORK} && python train_material_field.py ${COMMON_ARGS} --run_name ${run_name} ${extra_args}"
   ssh "$node" "mkdir -p '${run_dir}' && screen -dmS '${screen_name}' bash -lc \"${cmd} > '${run_dir}/screen.log' 2>&1\""
   echo "launched ${run_name} on ${node} dcu${dcu}"
 }
