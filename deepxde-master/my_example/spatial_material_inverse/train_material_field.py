@@ -701,6 +701,8 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
         geometry_frozen = configure_main_geometry_trainable(net, args, chunk_idx)
+        args._progress_step_offset = int(getattr(args, "_progress_manual_iterations", 0))
+        args._progress_initial_step = int(getattr(model.train_state, "step", 0)) + int(args._progress_step_offset)
         if len(chunk_sizes) == 1:
             alpha = 1.0
         else:
@@ -845,6 +847,8 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
         geometry_frozen = configure_main_geometry_trainable(net, args, chunk_idx)
+        args._progress_step_offset = int(getattr(args, "_progress_manual_iterations", 0))
+        args._progress_initial_step = int(getattr(model.train_state, "step", 0)) + int(args._progress_step_offset)
         if len(chunk_sizes) == 1:
             alpha = 1.0
         else:
@@ -1047,6 +1051,9 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
 def main():
     args = parse_args()
     case_config = prepare_run(args)
+    args._progress_step_offset = 0
+    args._progress_initial_step = 0
+    args._progress_manual_iterations = 0
 
     geom, data, metadata = build_data(args, case_config)
     model, net = build_model(args, data)
@@ -1068,6 +1075,7 @@ def main():
         remaining_iterations -= material_stage_iterations
         refinement_stage_iterations = min(max(args.refinement_stage_iterations, 0), max(remaining_iterations - 1, 0))
         main_iterations = args.iterations - warmup_iterations - geometry_stage_iterations - material_stage_iterations - refinement_stage_iterations
+        args._progress_manual_iterations = int(geometry_stage_iterations + material_stage_iterations)
         if warmup_iterations > 0:
             if args.freeze_material_warmup:
                 set_material_branch_trainable(net, False)
@@ -1216,6 +1224,8 @@ def main():
                 boundary_scale=args.refinement_stage_boundary_scale,
             )
             model.compile("adam", lr=args.refinement_stage_lr, loss_weights=refinement_weights)
+            args._progress_step_offset = int(getattr(args, "_progress_manual_iterations", 0))
+            args._progress_initial_step = int(getattr(model.train_state, "step", 0)) + int(args._progress_step_offset)
             refinement_callbacks = make_callbacks(args, args.save_dir, metadata)
             refinement_history, train_state = model.train(
                 iterations=refinement_stage_iterations,
@@ -1230,6 +1240,8 @@ def main():
         if original_sharpness is not None:
             net.interface_sharpness = float(original_sharpness)
     else:
+        args._progress_step_offset = 0
+        args._progress_initial_step = int(getattr(model.train_state, "step", 0))
         callbacks = make_callbacks(args, args.save_dir, metadata)
         losshistory, train_state = model.train(
             iterations=args.iterations,

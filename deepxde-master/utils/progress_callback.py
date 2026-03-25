@@ -16,6 +16,8 @@ class TqdmProgressCallback(dde.callbacks.Callback):
         ncols=100,
         bar_width=25,
         postfix_max_len=60,
+        initial_step=0,
+        step_offset=0,
     ):
         super().__init__()
         self.total_steps = int(total_steps) if total_steps is not None else 0
@@ -25,6 +27,8 @@ class TqdmProgressCallback(dde.callbacks.Callback):
         self.ncols = int(ncols)
         self.bar_width = int(bar_width)
         self.postfix_max_len = int(postfix_max_len)
+        self.initial_step = max(int(initial_step), 0)
+        self.step_offset = int(step_offset)
 
         self._bar = None
         self._last_step = 0
@@ -34,7 +38,7 @@ class TqdmProgressCallback(dde.callbacks.Callback):
 
     def on_train_begin(self):
         self._t0 = time.time()
-        self._last_step = 0
+        self._last_step = min(self.initial_step, self.total_steps)
         self._last_metric_step = -1
         self._last_metric_value = None
 
@@ -43,7 +47,7 @@ class TqdmProgressCallback(dde.callbacks.Callback):
 
         self._bar = tqdm(
             total=self.total_steps,
-            initial=0,
+            initial=min(self.initial_step, self.total_steps),
             dynamic_ncols=False,
             ncols=effective_ncols,
             leave=True,
@@ -104,7 +108,8 @@ class TqdmProgressCallback(dde.callbacks.Callback):
         return s
 
     def on_batch_end(self):
-        step = int(getattr(self.model.train_state, "step", 0))
+        raw_step = int(getattr(self.model.train_state, "step", 0))
+        step = min(max(raw_step + self.step_offset, self._last_step), self.total_steps)
         train_loss = self._loss_scalar(getattr(self.model.train_state, "loss_train", None))
         test_loss = self._loss_scalar(getattr(self.model.train_state, "loss_test", None))
 

@@ -2273,6 +2273,8 @@ def make_callbacks(args, save_dir, metadata):
             total_steps=args.iterations,
             display_every=args.display_every,
             metric_name="relL2",
+            initial_step=getattr(args, "_progress_initial_step", 0),
+            step_offset=getattr(args, "_progress_step_offset", 0),
         ),
     ]
     return callbacks
