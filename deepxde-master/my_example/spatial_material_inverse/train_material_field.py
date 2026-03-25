@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--material_stage_binary_weight", type=float, default=0.05)
     parser.add_argument("--material_stage_contrast_weight", type=float, default=0.0)
     parser.add_argument("--material_stage_lambda_gap_target", type=float, default=0.0)
+    parser.add_argument("--material_stage_bulk_gap_target", type=float, default=0.0)
     parser.add_argument("--material_stage_mu_gap_target", type=float, default=0.0)
     parser.add_argument("--geometry_prior_weight", type=float, default=0.0)
     parser.add_argument("--layer_y_prior_target", type=float, default=0.5)
@@ -123,6 +124,15 @@ def parse_args():
     parser.add_argument("--geometry_stage_domain_points", type=int, default=1024)
     parser.add_argument("--material_stage_domain_points", type=int, default=1024)
     return parser.parse_args()
+
+
+def extract_region_summary_from_diagnostics(diagnostics):
+    summary = {}
+    for key in ("bulk_regions", "lambda_regions", "mu_regions"):
+        value = diagnostics.get(key)
+        if torch.is_tensor(value):
+            summary[key] = [float(item) for item in value.detach().cpu().numpy().tolist()]
+    return summary
 
 
 def set_requires_grad(module, flag):
@@ -389,7 +399,7 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
     geometry_prior = torch.zeros((), dtype=torch.float32, device=device)
     geometry_values = {}
     for key, value in diagnostics.items():
-        if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
+        if key in {"bulk", "lambda", "mu", "interface_indicator", "class_probs", "bulk_regions", "lambda_regions", "mu_regions"}:
             continue
         if torch.is_tensor(value) and value.numel() == 1:
             geometry_values[key] = value
@@ -404,6 +414,7 @@ def compute_compact_material_stage_terms(net, domain_points, case_config, reg_we
         "binary_penalty": binary_penalty,
         "geometry_prior": geometry_prior,
         "mean_class_probs": mean_probs,
+        "bulk_regions": diagnostics.get("bulk_regions"),
         "lambda_regions": diagnostics["lambda_regions"],
         "mu_regions": diagnostics["mu_regions"],
         "geometry_values": geometry_values,
@@ -494,6 +505,8 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
         }
+        if torch.is_tensor(terms.get("bulk_regions")):
+            row["bulk_regions"] = [float(value) for value in terms["bulk_regions"].detach().cpu().numpy().tolist()]
         for key, value in terms["geometry_values"].items():
             row[key] = float(value.detach().cpu().item())
         if best_row is None or row["total_loss"] < best_row["total_loss"]:
@@ -597,7 +610,15 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         contrast_penalty = torch.zeros((), dtype=torch.float32, device=total_loss.device)
         lambda_regions = terms["lambda_regions"]
         mu_regions = terms["mu_regions"]
-        if lambda_regions.numel() >= 2:
+        bulk_regions = terms.get("bulk_regions")
+        if torch.is_tensor(bulk_regions) and bulk_regions.numel() >= 2:
+            bulk_gap = bulk_regions[1] - bulk_regions[0]
+            mu_gap = mu_regions[1] - mu_regions[0]
+            contrast_penalty = (
+                torch.relu(float(args.material_stage_bulk_gap_target) - bulk_gap) ** 2
+                + torch.relu(float(args.material_stage_mu_gap_target) - mu_gap) ** 2
+            )
+        elif lambda_regions.numel() >= 2:
             lambda_gap = lambda_regions[1] - lambda_regions[0]
             mu_gap = mu_regions[1] - mu_regions[0]
             contrast_penalty = (
@@ -621,6 +642,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
             "lambda_regions": [float(value) for value in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(value) for value in terms["mu_regions"].detach().cpu().numpy().tolist()],
         }
+        if torch.is_tensor(terms.get("bulk_regions")):
+            row["bulk_regions"] = [float(value) for value in terms["bulk_regions"].detach().cpu().numpy().tolist()]
         for key, value in terms["geometry_values"].items():
             row[key] = float(value.detach().cpu().item())
         if best_row is None or row["total_loss"] < best_row["total_loss"]:
@@ -740,14 +763,7 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
                 diagnostics = net.predict_material_diagnostics(
                     torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=diag_device)
                 )
-            if "lambda_regions" in diagnostics:
-                region_summary["lambda_regions"] = [
-                    float(value) for value in diagnostics["lambda_regions"].detach().cpu().numpy().tolist()
-                ]
-            if "mu_regions" in diagnostics:
-                region_summary["mu_regions"] = [
-                    float(value) for value in diagnostics["mu_regions"].detach().cpu().numpy().tolist()
-                ]
+            region_summary.update(extract_region_summary_from_diagnostics(diagnostics))
         schedule_rows.append(
             {
                 "chunk": int(chunk_idx),
@@ -988,6 +1004,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             "mean_class_probs": [float(v) for v in terms["mean_class_probs"].detach().cpu().numpy().tolist()],
             "lambda_regions": [float(v) for v in terms["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(v) for v in terms["mu_regions"].detach().cpu().numpy().tolist()],
+            **({"bulk_regions": [float(v) for v in terms["bulk_regions"].detach().cpu().numpy().tolist()]} if torch.is_tensor(terms.get("bulk_regions")) else {}),
             "update_reason": update_reason,
         }
         for key, value in terms["geometry_values"].items():
@@ -1174,7 +1191,7 @@ def main():
                     "material_stage_domain_points": args.material_stage_domain_points,
                     "load_scales": args.load_scales,
                     "primary_load_index": args.primary_load_index,
-                    "material_parameterization": getattr(args, "material_parameterization", "lamemu"),
+                    "material_parameterization": getattr(args, "material_parameterization", "bulkmu"),
                 },
             )
             set_material_branch_trainable(net, True)

@@ -221,7 +221,7 @@ def plot_all_loss_components(losshistory, save_dir, filename="所有损失项详
 
 def _extract_true_region_constants(case_config, num_regions):
     if case_config is None or num_regions <= 0:
-        return [], []
+        return [], [], []
 
     lambda_truths = [float(case_config.lambda_bg)]
     mu_truths = [float(case_config.mu_bg)]
@@ -233,7 +233,10 @@ def _extract_true_region_constants(case_config, num_regions):
         lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_2))
         mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_2))
 
-    return lambda_truths[:num_regions], mu_truths[:num_regions]
+    lambda_truths = lambda_truths[:num_regions]
+    mu_truths = mu_truths[:num_regions]
+    bulk_truths = [float(lmbd + (2.0 / 3.0) * mu) for lmbd, mu in zip(lambda_truths, mu_truths)]
+    return lambda_truths, mu_truths, bulk_truths
 
 
 def _append_region_history(records, history_rows, step_offset=0, running_step=None):
@@ -241,6 +244,7 @@ def _append_region_history(records, history_rows, step_offset=0, running_step=No
     for row in history_rows:
         lambda_regions = row.get("lambda_regions")
         mu_regions = row.get("mu_regions")
+        bulk_regions = row.get("bulk_regions")
         if not isinstance(lambda_regions, list) or not isinstance(mu_regions, list):
             continue
         if len(lambda_regions) == 0 or len(lambda_regions) != len(mu_regions):
@@ -258,13 +262,14 @@ def _append_region_history(records, history_rows, step_offset=0, running_step=No
         else:
             continue
 
-        records.append(
-            {
-                "step": step,
-                "lambda_regions": [float(value) for value in lambda_regions],
-                "mu_regions": [float(value) for value in mu_regions],
-            }
-        )
+        payload = {
+            "step": step,
+            "lambda_regions": [float(value) for value in lambda_regions],
+            "mu_regions": [float(value) for value in mu_regions],
+        }
+        if isinstance(bulk_regions, list) and len(bulk_regions) == len(mu_regions):
+            payload["bulk_regions"] = [float(value) for value in bulk_regions]
+        records.append(payload)
     return current_step
 
 
@@ -329,13 +334,15 @@ def plot_region_parameter_evolution(
         lambda_regions = final_region_payload.get("lambda_regions")
         mu_regions = final_region_payload.get("mu_regions")
         if isinstance(lambda_regions, list) and isinstance(mu_regions, list) and len(lambda_regions) == len(mu_regions):
-            records.append(
-                {
-                    "step": int(total_iterations),
-                    "lambda_regions": [float(value) for value in lambda_regions],
-                    "mu_regions": [float(value) for value in mu_regions],
-                }
-            )
+            payload = {
+                "step": int(total_iterations),
+                "lambda_regions": [float(value) for value in lambda_regions],
+                "mu_regions": [float(value) for value in mu_regions],
+            }
+            bulk_regions = final_region_payload.get("bulk_regions")
+            if isinstance(bulk_regions, list) and len(bulk_regions) == len(mu_regions):
+                payload["bulk_regions"] = [float(value) for value in bulk_regions]
+            records.append(payload)
 
     if not records:
         return None
@@ -345,36 +352,47 @@ def plot_region_parameter_evolution(
         unique_records[int(row["step"])] = row
     records = [unique_records[key] for key in sorted(unique_records)]
 
-    num_regions = len(records[-1]["lambda_regions"])
-    lambda_truths, mu_truths = _extract_true_region_constants(case_config, num_regions)
+    num_regions = len(records[-1]["mu_regions"])
+    lambda_truths, mu_truths, bulk_truths = _extract_true_region_constants(case_config, num_regions)
     steps = [int(row["step"]) for row in records]
     lambda_matrix = np.asarray([row["lambda_regions"] for row in records], dtype=float)
     mu_matrix = np.asarray([row["mu_regions"] for row in records], dtype=float)
+    has_bulk = all("bulk_regions" in row for row in records)
+    bulk_matrix = np.asarray([row["bulk_regions"] for row in records], dtype=float) if has_bulk else None
+    parameterization = str(final_region_payload.get("parameterization", "bulkmu" if has_bulk else "lamemu")) if final_region_payload else ("bulkmu" if has_bulk else "lamemu")
 
     payload = {
         "steps": steps,
+        "parameterization": parameterization,
         "lambda_regions": lambda_matrix.tolist(),
         "mu_regions": mu_matrix.tolist(),
         "lambda_truths": lambda_truths,
         "mu_truths": mu_truths,
     }
+    if has_bulk:
+        payload["bulk_regions"] = bulk_matrix.tolist()
+        payload["bulk_truths"] = bulk_truths
     with open(output_json_path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+    if has_bulk:
+        matrices = [bulk_matrix, mu_matrix]
+        truths = [bulk_truths, mu_truths]
+        field_names = ["Bulk", "Mu"]
+    else:
+        matrices = [lambda_matrix, mu_matrix]
+        truths = [lambda_truths, mu_truths]
+        field_names = ["Lambda", "Mu"]
 
     fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4", "#ff7f0e", "#2ca02c"])
 
-    for axis, matrix, truths, field_name in zip(
-        axes,
-        [lambda_matrix, mu_matrix],
-        [lambda_truths, mu_truths],
-        ["Lambda", "Mu"],
-    ):
+    for axis, matrix, truth_values, field_name in zip(axes, matrices, truths, field_names):
         for index in range(matrix.shape[1]):
             color = colors[index % len(colors)]
             axis.plot(steps, matrix[:, index], color=color, linewidth=2.0, label=f"pred_r{index}")
-            if index < len(truths):
-                axis.axhline(truths[index], color=color, linestyle="--", linewidth=1.6, alpha=0.85, label=f"true_r{index}")
+            if index < len(truth_values):
+                axis.axhline(truth_values[index], color=color, linestyle="--", linewidth=1.6, alpha=0.85, label=f"true_r{index}")
         axis.set_title(f"{field_name} Regions vs Step")
         axis.set_xlabel("Step")
         axis.set_ylabel(field_name)
@@ -391,6 +409,7 @@ def plot_region_parameter_evolution(
     plt.savefig(output_png_path, dpi=300)
     plt.close(fig)
     return payload
+
 
 def save_model_checkpoint(model, save_dir, filename="model.ckpt"):
     """

@@ -134,7 +134,15 @@ def parse_load_modes(value):
         if not text:
             return []
         modes = [v.strip().lower() for v in text.split(",") if v.strip()]
-    valid_modes = {"legacy", "x_tension", "y_tension", "shear"}
+    valid_modes = {
+        "legacy",
+        "x_tension",
+        "y_tension",
+        "shear",
+        "biaxial_bulk",
+        "uniaxial_x",
+        "pure_shear",
+    }
     for mode in modes:
         if mode not in valid_modes:
             raise ValueError(f"Unsupported load mode: {mode}. Valid modes: {sorted(valid_modes)}")
@@ -287,6 +295,15 @@ def exact_displacement_numpy(points, case_config, load_scale=1.0, load_mode="leg
     elif mode == "shear":
         ux = load_scale * base_amp * np.sin(PI * x) * np.sin(2.0 * PI * y)
         uy = load_scale * base_amp * np.sin(2.0 * PI * x) * np.sin(PI * y)
+    elif mode == "biaxial_bulk":
+        ux = load_scale * base_amp * np.sin(PI * x)
+        uy = load_scale * base_amp * np.sin(PI * y)
+    elif mode == "uniaxial_x":
+        ux = load_scale * base_amp * np.sin(PI * x)
+        uy = np.zeros_like(ux)
+    elif mode == "pure_shear":
+        ux = load_scale * base_amp * np.sin(PI * y)
+        uy = load_scale * base_amp * np.sin(PI * x)
     else:
         raise ValueError(f"Unsupported load_mode: {load_mode}")
     return ux, uy
@@ -318,6 +335,18 @@ def exact_strain_numpy(points, case_config, load_scale=1.0, load_mode="legacy"):
         exy = load_scale * base_amp * PI * (
             np.sin(PI * x) * np.cos(2.0 * PI * y) + np.cos(2.0 * PI * x) * np.sin(PI * y)
         )
+    elif mode == "biaxial_bulk":
+        exx = load_scale * base_amp * PI * np.cos(PI * x)
+        eyy = load_scale * base_amp * PI * np.cos(PI * y)
+        exy = np.zeros_like(exx)
+    elif mode == "uniaxial_x":
+        exx = load_scale * base_amp * PI * np.cos(PI * x)
+        eyy = np.zeros_like(exx)
+        exy = np.zeros_like(exx)
+    elif mode == "pure_shear":
+        exx = np.zeros_like(x)
+        eyy = np.zeros_like(y)
+        exy = 0.5 * load_scale * base_amp * PI * (np.cos(PI * y) + np.cos(PI * x))
     else:
         raise ValueError(f"Unsupported load_mode: {load_mode}")
     return exx, eyy, exy
@@ -368,6 +397,24 @@ def exact_state_torch(x, case_config, load_scale=1.0, load_mode="legacy"):
         exy = load_scale * base_amp * PI * (
             torch.sin(PI * px) * torch.cos(2.0 * PI * py) + torch.cos(2.0 * PI * px) * torch.sin(PI * py)
         )
+    elif mode == "biaxial_bulk":
+        ux = load_scale * base_amp * torch.sin(PI * px)
+        uy = load_scale * base_amp * torch.sin(PI * py)
+        exx = load_scale * base_amp * PI * torch.cos(PI * px)
+        eyy = load_scale * base_amp * PI * torch.cos(PI * py)
+        exy = torch.zeros_like(exx)
+    elif mode == "uniaxial_x":
+        ux = load_scale * base_amp * torch.sin(PI * px)
+        uy = torch.zeros_like(ux)
+        exx = load_scale * base_amp * PI * torch.cos(PI * px)
+        eyy = torch.zeros_like(exx)
+        exy = torch.zeros_like(exx)
+    elif mode == "pure_shear":
+        ux = load_scale * base_amp * torch.sin(PI * py)
+        uy = load_scale * base_amp * torch.sin(PI * px)
+        exx = torch.zeros_like(px)
+        eyy = torch.zeros_like(py)
+        exy = 0.5 * load_scale * base_amp * PI * (torch.cos(PI * py) + torch.cos(PI * px))
     else:
         raise ValueError(f"Unsupported load_mode: {load_mode}")
     lmbd, mu = exact_material_torch(x, case_config)
@@ -953,12 +1000,17 @@ class SmoothGeometryAwareMaterialNetV3(dde.nn.pytorch.nn.NN):
         return diagnostics
 
 
-def make_output_transform(lambda_floor, mu_floor, method=None, num_loads=1):
+def make_output_transform(lambda_floor, mu_floor, k_floor=0.2, parameterization="bulkmu", method=None, num_loads=1):
     def output_transform(inputs, outputs):
         state_width = 5 * int(max(num_loads, 1))
         state_outputs = outputs[:, :state_width]
-        lmbd = lambda_floor + F.softplus(outputs[:, state_width:state_width + 1])
-        mu = mu_floor + F.softplus(outputs[:, state_width + 1:state_width + 2])
+        if str(parameterization).lower() == "bulkmu":
+            bulk = k_floor + F.softplus(outputs[:, state_width:state_width + 1])
+            mu = mu_floor + F.softplus(outputs[:, state_width + 1:state_width + 2])
+            lmbd = torch.clamp(bulk - (2.0 / 3.0) * mu, min=lambda_floor)
+        else:
+            lmbd = lambda_floor + F.softplus(outputs[:, state_width:state_width + 1])
+            mu = mu_floor + F.softplus(outputs[:, state_width + 1:state_width + 2])
         return torch.cat((state_outputs, lmbd, mu), dim=1)
 
     return output_transform
@@ -1021,7 +1073,16 @@ def build_network(args):
             num_frequencies=args.num_frequencies,
             backbone_type=args.backbone_type,
         )
-        net.apply_output_transform(make_output_transform(args.lambda_floor, args.mu_floor, args.method, num_loads=num_loads))
+        net.apply_output_transform(
+            make_output_transform(
+                args.lambda_floor,
+                args.mu_floor,
+                k_floor=args.k_floor,
+                parameterization=args.material_parameterization,
+                method=args.method,
+                num_loads=num_loads,
+            )
+        )
     return net
 
 
@@ -1611,6 +1672,7 @@ def save_training_artifacts(
             lambda_regions = net.lambda_floor + F.softplus(net.raw_lambda_params)
             mu_regions = net.mu_floor + F.softplus(net.raw_mu_params)
         region_payload = {
+            "parameterization": "lamemu",
             "lambda_regions": [float(v) for v in lambda_regions.detach().cpu().numpy().tolist()],
             "mu_regions": [float(v) for v in mu_regions.detach().cpu().numpy().tolist()],
             "num_regions": int(net.num_regions),
@@ -1622,12 +1684,15 @@ def save_training_artifacts(
         with torch.no_grad():
             diagnostics = net.predict_material_diagnostics(torch.tensor([[0.5, 0.5]], dtype=torch.float32, device=device))
         region_payload = {
+            "parameterization": str(getattr(args, "material_parameterization", "lamemu")),
             "lambda_regions": [float(v) for v in diagnostics["lambda_regions"].detach().cpu().numpy().tolist()],
             "mu_regions": [float(v) for v in diagnostics["mu_regions"].detach().cpu().numpy().tolist()],
             "num_regions": int(net.num_regions),
         }
+        if "bulk_regions" in diagnostics:
+            region_payload["bulk_regions"] = [float(v) for v in diagnostics["bulk_regions"].detach().cpu().numpy().tolist()]
         for key, value in diagnostics.items():
-            if key in {"lambda", "mu", "interface_indicator", "class_probs", "lambda_regions", "mu_regions"}:
+            if key in {"bulk", "lambda", "mu", "interface_indicator", "class_probs", "bulk_regions", "lambda_regions", "mu_regions"}:
                 continue
             if torch.is_tensor(value) and value.numel() == 1:
                 region_payload[key] = float(value.detach().cpu().item())
