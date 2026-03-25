@@ -254,13 +254,13 @@ def initialize_geometry_parameters(args, net):
         net.raw_layer_y.data.fill_(raw_value)
 
 
-def save_stage_loss_artifacts(losshistory, save_dir, stage_name, args=None):
+def save_stage_loss_artifacts(losshistory, save_dir, stage_name, args=None, save_plots=True):
     if losshistory is None:
         return
     save_loss_history_json(losshistory, save_dir, filename=f"{stage_name}_loss_history.json")
     save_best_test_loss_json(losshistory, save_dir, filename=f"{stage_name}_best_test_loss.json")
     save_loss_history_dat(losshistory, save_dir, filename=f"{stage_name}_loss_history.dat")
-    if args is not None:
+    if args is not None and save_plots:
         num_pde = len(pde_loss_names(args.reg_weight, args.method, getattr(args, "load_scales", "1.0")))
         plot_and_save_loss_history(
             losshistory,
@@ -729,7 +729,7 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
             display_every=max(100, min(args.display_every, chunk_iterations)),
             callbacks=callbacks,
         )
-        save_stage_loss_artifacts(losshistory, save_dir, f"main_chunk_{chunk_idx}", args=args)
+        save_stage_loss_artifacts(losshistory, save_dir, f"main_chunk_{chunk_idx}", args=args, save_plots=False)
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
@@ -868,7 +868,7 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             display_every=max(100, min(args.display_every, chunk_iterations)),
             callbacks=callbacks,
         )
-        save_stage_loss_artifacts(losshistory, save_dir, f"adaptive_main_chunk_{chunk_idx}", args=args)
+        save_stage_loss_artifacts(losshistory, save_dir, f"adaptive_main_chunk_{chunk_idx}", args=args, save_plots=False)
 
         val_mse = compute_observation_mse(
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
