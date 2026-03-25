@@ -23,4 +23,4 @@ launch_one() {
 }
 
 launch_one 10.6.234.29 0 pinn pinn_kmu_3load_smoke2k --hidden_layers 128,128,128,128
-launch_one 10.6.234.30 0 geoiaminn_v3 geoiaminnv3_kmu_3load_smoke2k "
+launch_one 10.6.234.30 0 geoiaminn_v3 geoiaminnv3_kmu_3load_smoke2k ""
