@@ -6,7 +6,6 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -35,6 +34,15 @@ from utils.data_saving_utils import _get_save_path, save_prediction_data
 from utils.device_utils import print_gpu_info, set_random_seed
 from utils.loss_callback import LossHistoryCallback
 from utils.progress_callback import TqdmProgressCallback
+from utils.material_inverse_plot_utils import (
+    plot_case_sampling_layout,
+    plot_field_triplet,
+    plot_interface_diagnostics,
+    plot_material_overlay,
+    plot_observation_fit,
+    plot_validation_history,
+    reshape_grid,
+)
 from utils.save_results import (
     plot_all_loss_components,
     plot_and_save_loss_history,
@@ -1462,72 +1470,24 @@ def save_case_and_sampling_figure(
     lambda_field = exact_fields[:, 5].reshape(xx.shape)
     mu_field = exact_fields[:, 6].reshape(xx.shape)
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-    for axis, field, label in zip(
-        axes[:2],
-        [lambda_field, mu_field],
-        [r"True $\lambda(x,y)$", r"True $\mu(x,y)$"],
-    ):
-        image = axis.contourf(xx, yy, field, levels=100, cmap="viridis")
-        axis.set_title(label)
-        axis.set_xlabel("x")
-        axis.set_ylabel("y")
-        axis.set_aspect("equal")
-        fig.colorbar(image, ax=axis)
-
-    axes[2].scatter(domain_points[:, 0], domain_points[:, 1], s=8, alpha=0.25, label="Domain points")
-    if len(boundary_points) > 0:
-        axes[2].scatter(
-            boundary_points[:, 0],
-            boundary_points[:, 1],
-            s=22,
-            alpha=0.9,
-            color="#111827",
-            marker="x",
-            label="Boundary points",
-        )
-    if len(train_observation_points) > 0:
-        axes[2].scatter(
-            train_observation_points[:, 0],
-            train_observation_points[:, 1],
-            s=18,
-            alpha=0.85,
-            color="#d97706",
-            label="Train observations",
-        )
-    if len(val_observation_points) > 0:
-        axes[2].scatter(
-            val_observation_points[:, 0],
-            val_observation_points[:, 1],
-            s=22,
-            alpha=0.85,
-            color="#0f766e",
-            marker="^",
-            label="Validation observations",
-        )
-    if len(eval_observation_points) > 0:
-        axes[2].scatter(
-            eval_observation_points[:, 0],
-            eval_observation_points[:, 1],
-            s=22,
-            alpha=0.85,
-            color="#7c3aed",
-            marker="s",
-            label="Evaluation observations",
-        )
-    axes[2].set_title(f"Sampling layout ({title_suffix})")
-    axes[2].set_xlabel("x")
-    axes[2].set_ylabel("y")
-    axes[2].set_xlim(0.0, 1.0)
-    axes[2].set_ylim(0.0, 1.0)
-    axes[2].set_aspect("equal")
-    axes[2].legend(frameon=False, loc="upper right")
-    plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", filename), dpi=300)
-    plt.close(fig)
+    plot_case_sampling_layout(
+        save_dir=save_dir,
+        xx=xx,
+        yy=yy,
+        lambda_field=lambda_field,
+        mu_field=mu_field,
+        domain_points=domain_points,
+        boundary_points=boundary_points,
+        train_observation_points=train_observation_points,
+        val_observation_points=val_observation_points,
+        eval_observation_points=eval_observation_points,
+        title_suffix=title_suffix,
+        filename=filename,
+    )
 
 
 def save_training_artifacts(
+
     args,
     save_dir,
     case_config,
@@ -1855,18 +1815,7 @@ def compute_observation_mse(model, args, observation_points, observation_truth):
 
 def save_validation_history(history, save_dir):
     save_json(_get_save_path(save_dir, "json", "validation_history.json"), history)
-    if not history["steps"]:
-        return
-    fig, ax = plt.subplots(figsize=(9.0, 4.8))
-    ax.plot(history["steps"], history["validation_observation_mse"], color="#0f766e", linewidth=2.0)
-    ax.set_xlabel("Steps")
-    ax.set_ylabel("Validation observation MSE")
-    ax.set_title("Validation observation history")
-    ax.set_yscale("log")
-    ax.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", "validation_history.png"), dpi=300)
-    plt.close(fig)
+    plot_validation_history(history, save_dir)
 
 
 class ValidationObservationCheckpoint(dde.callbacks.Callback):
@@ -1952,136 +1901,8 @@ class ValidationObservationCheckpoint(dde.callbacks.Callback):
         save_validation_history(self.history, self.save_dir)
 
 
-def reshape_grid(values, ny, nx):
-    return values.reshape(ny, nx)
-
-
-def plot_field_triplet(save_dir, xx, yy, truth_grid, pred_grid, field_name):
-    truth_grid = np.asarray(truth_grid)
-    pred_grid = np.asarray(pred_grid)
-    abs_error = np.abs(pred_grid - truth_grid)
-
-    truth_min = float(np.nanmin(truth_grid))
-    truth_max = float(np.nanmax(truth_grid))
-    pred_min = float(np.nanmin(pred_grid))
-    pred_max = float(np.nanmax(pred_grid))
-
-    def get_levels(vmin, vmax):
-        if not np.isfinite(vmin) or not np.isfinite(vmax):
-            vmin, vmax = -1.0, 1.0
-        if vmin == vmax:
-            delta = 1.0 if vmin == 0.0 else abs(vmin) * 1e-6
-            vmin -= delta
-            vmax += delta
-        return vmin, vmax, np.linspace(vmin, vmax, 101)
-
-    truth_vmin, truth_vmax, truth_levels = get_levels(truth_min, truth_max)
-    pred_vmin, pred_vmax, pred_levels = get_levels(pred_min, pred_max)
-
-    err_max = float(np.nanmax(abs_error))
-    if not np.isfinite(err_max) or err_max == 0.0:
-        err_levels = np.linspace(0.0, 1.0, 101)
-    else:
-        err_levels = np.linspace(0.0, err_max, 101)
-
-    fig, axes = plt.subplots(1, 3, figsize=(16.5, 4.5), constrained_layout=True)
-
-    im0 = axes[0].contourf(xx, yy, truth_grid, levels=truth_levels, cmap="viridis", vmin=truth_vmin, vmax=truth_vmax)
-    axes[0].set_title(f"True {field_name}")
-    axes[0].set_xlabel("x")
-    axes[0].set_ylabel("y")
-    axes[0].set_aspect("equal")
-    fig.colorbar(im0, ax=axes[0])
-
-    im1 = axes[1].contourf(xx, yy, pred_grid, levels=pred_levels, cmap="viridis", vmin=pred_vmin, vmax=pred_vmax)
-    axes[1].set_title(f"Predicted {field_name}")
-    axes[1].set_xlabel("x")
-    axes[1].set_ylabel("y")
-    axes[1].set_aspect("equal")
-    fig.colorbar(im1, ax=axes[1])
-
-    im2 = axes[2].contourf(xx, yy, abs_error, levels=err_levels, cmap="magma")
-    axes[2].set_title(f"Absolute error of {field_name}")
-    axes[2].set_xlabel("x")
-    axes[2].set_ylabel("y")
-    axes[2].set_aspect("equal")
-    fig.colorbar(im2, ax=axes[2])
-
-    plt.savefig(_get_save_path(save_dir, "png", f"{field_name}_comparison.png"), dpi=300)
-    plt.close(fig)
-
-
-def plot_material_overlay(save_dir, xx, yy, truth_grid, pred_grid, field_name):
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-    for axis, grid, title in zip(
-        axes,
-        [truth_grid, pred_grid],
-        [f"True {field_name}", f"Predicted {field_name}"],
-    ):
-        vmin, vmax = float(np.min(grid)), float(np.max(grid))
-        if not np.isfinite(vmin) or not np.isfinite(vmax):
-            vmin, vmax = -1.0, 1.0
-        if vmin == vmax:
-            delta = 1.0 if vmin == 0.0 else abs(vmin) * 1e-6
-            vmin -= delta
-            vmax += delta
-        levels = np.linspace(vmin, vmax, 24)
-        
-        image = axis.contourf(xx, yy, grid, levels=levels, cmap="viridis")
-        axis.contour(xx, yy, grid, levels=levels[::3], colors="white", linewidths=0.5)
-        axis.set_title(title)
-        axis.set_xlabel("x")
-        axis.set_ylabel("y")
-        axis.set_aspect("equal")
-        plt.colorbar(image, ax=axis)
-    plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", f"{field_name}_material_map.png"), dpi=300)
-    plt.close(fig)
-
-
-def plot_observation_fit(save_dir, observation_truth, observation_prediction, filename="observation_fit.png"):
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-    for axis, index, label in zip(axes, [0, 1], ["ux", "uy"]):
-        axis.scatter(
-            observation_truth[:, index],
-            observation_prediction[:, index],
-            s=16,
-            alpha=0.75,
-            color="#355F94",
-        )
-        limits = [
-            float(min(np.min(observation_truth[:, index]), np.min(observation_prediction[:, index]))),
-            float(max(np.max(observation_truth[:, index]), np.max(observation_prediction[:, index]))),
-        ]
-        axis.plot(limits, limits, linestyle="--", color="#d97706", linewidth=1.2)
-        axis.set_xlabel(f"Observed {label}")
-        axis.set_ylabel(f"Predicted {label}")
-        axis.set_title(f"Observation fit for {label}")
-        axis.grid(True, alpha=0.2)
-    plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", filename), dpi=300)
-    plt.close(fig)
-
-
-def plot_interface_diagnostics(save_dir, xx, yy, interface_indicator_grid, class_probability_grid, split_name):
-    fig, axes = plt.subplots(1, 2, figsize=(10.8, 4.5))
-    for axis, grid, title in zip(
-        axes,
-        [interface_indicator_grid, class_probability_grid],
-        ["Interface indicator", "Region probability"],
-    ):
-        image = axis.contourf(xx, yy, grid, levels=100, cmap="coolwarm")
-        axis.set_title(title)
-        axis.set_xlabel("x")
-        axis.set_ylabel("y")
-        axis.set_aspect("equal")
-        plt.colorbar(image, ax=axis)
-    plt.tight_layout()
-    plt.savefig(_get_save_path(save_dir, "png", f"{split_name}_interface_diagnostics.png"), dpi=300)
-    plt.close(fig)
-
-
 def evaluate_model(
+
     args,
     model,
     save_dir,
