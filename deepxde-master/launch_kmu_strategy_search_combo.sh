@@ -111,11 +111,14 @@ GEO_FORMAL_COMMON=(
   --geometry_stage_physics_scale 0.02
   --material_stage_physics_scale 0.05
   --adaptive_main_stage
-  --adaptive_main_chunks 16
+  --adaptive_main_chunks 4
   --adaptive_main_base_physics_scale 0.35
   --adaptive_main_reg_scale 1.0
   --adaptive_main_data_scale 1.5
   --adaptive_main_boundary_scale 1.5
+  --adaptive_main_signal_points 512
+  --adaptive_main_signal_observe_points 256
+  --adaptive_main_signal_boundary_points 256
   --adaptive_main_min_physics_scale 0.1
   --adaptive_main_max_physics_scale 1.0
   --adaptive_main_min_data_scale 0.5

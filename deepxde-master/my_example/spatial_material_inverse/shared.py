@@ -2107,7 +2107,7 @@ def build_model(args, data):
     return model, net
 
 
-def make_callbacks(args, save_dir, metadata):
+def make_callbacks(args, save_dir, metadata, include_history=True, include_checkpoint=True):
     num_pde = len(
         pde_loss_names(
             args.reg_weight,
@@ -2128,8 +2128,10 @@ def make_callbacks(args, save_dir, metadata):
             ]
         )
     model_dir = ensure_dir(os.path.join(save_dir, "model"))
-    callbacks = [
-        LossHistoryCallback(
+    callbacks = []
+    if include_history:
+        callbacks.append(
+            LossHistoryCallback(
             save_dir=save_dir,
             period=args.display_every,
             filename="loss_history.png",
@@ -2145,8 +2147,11 @@ def make_callbacks(args, save_dir, metadata):
             pde_label="Physics Loss",
             bc_label="Boundary + Observation Loss",
             save_all_components=True,
-        ),
-        ValidationObservationCheckpoint(
+        )
+        )
+    if include_checkpoint:
+        callbacks.append(
+            ValidationObservationCheckpoint(
             filepath=os.path.join(model_dir, "best_model"),
             save_dir=save_dir,
             observation_points=[payload["points"] for payload in metadata.get("val_observation_loads", [metadata["val_observation"]])],
@@ -2154,15 +2159,17 @@ def make_callbacks(args, save_dir, metadata):
             args=args,
             period=args.display_every,
             verbose=1,
-        ),
+        )
+        )
+    callbacks.append(
         TqdmProgressCallback(
             total_steps=args.iterations,
             display_every=args.display_every,
             metric_name="relL2",
             initial_step=getattr(args, "_progress_initial_step", 0),
             step_offset=getattr(args, "_progress_step_offset", 0),
-        ),
-    ]
+        )
+    )
     return callbacks
 
 

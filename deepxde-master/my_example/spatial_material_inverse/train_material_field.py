@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -33,6 +34,7 @@ from shared import (
     plot_all_loss_components,
     plot_and_save_loss_history,
     resolve_load_specs,
+    save_validation_history,
 )
 
 from utils.device_utils import enforce_and_report_runtime_device
@@ -100,12 +102,16 @@ def parse_args():
     parser.add_argument("--adaptive_main_data_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_boundary_scale", type=float, default=1.0)
     parser.add_argument("--adaptive_main_domain_points", type=int, default=2048)
+    parser.add_argument("--adaptive_main_signal_points", type=int, default=512)
+    parser.add_argument("--adaptive_main_signal_observe_points", type=int, default=256)
+    parser.add_argument("--adaptive_main_signal_boundary_points", type=int, default=256)
     parser.add_argument(
         "--adaptive_main_strategy",
         type=str,
         default="val_feedback",
         choices=["val_feedback", "multiloss", "grad_balance"],
     )
+    parser.add_argument("--adaptive_main_full_callbacks", action="store_true")
     parser.add_argument("--adaptive_main_scale_ema", type=float, default=0.5)
     parser.add_argument("--adaptive_main_min_data_scale", type=float, default=0.25)
     parser.add_argument("--adaptive_main_max_data_scale", type=float, default=4.0)
@@ -197,6 +203,130 @@ def average_multiload_fit_losses(net, metadata, args, device, target_kind="noisy
         torch.mean(torch.stack(boundary_terms)) if boundary_terms else torch.zeros((), dtype=torch.float32, device=device)
     )
     return data_mse, boundary_mse
+
+
+def subsample_payload_arrays(points, values, max_points, seed):
+    points = np.asarray(points, dtype=float)
+    values = np.asarray(values, dtype=float)
+    if max_points is None or int(max_points) <= 0 or len(points) <= int(max_points):
+        return points, values
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(points), size=int(max_points), replace=False)
+    return points[indices], values[indices]
+
+
+def prepare_multiload_fit_tensors(
+    metadata,
+    args,
+    device,
+    target_kind="noisy",
+    train_limit=None,
+    boundary_limit=None,
+    seed=0,
+):
+    load_count = compact_num_loads(args)
+    train_payloads = metadata.get("train_observation_loads", [metadata["train_observation"]])
+    boundary_payloads = metadata.get("boundary_observation_loads", [metadata["boundary_observation"]])
+    cached_train_payloads = []
+    cached_boundary_payloads = []
+    for load_index in range(load_count):
+        train_payload = train_payloads[load_index]
+        boundary_payload = boundary_payloads[load_index]
+        train_points, train_values = subsample_payload_arrays(
+            train_payload["points"],
+            train_payload[target_kind],
+            train_limit,
+            seed + 17 * (load_index + 1),
+        )
+        boundary_points, boundary_values = subsample_payload_arrays(
+            boundary_payload["points"],
+            boundary_payload["clean"],
+            boundary_limit,
+            seed + 101 * (load_index + 1),
+        )
+        cached_train_payloads.append(
+            {
+                "points": torch.as_tensor(train_points, dtype=torch.float32, device=device),
+                "values": torch.as_tensor(train_values, dtype=torch.float32, device=device),
+            }
+        )
+        cached_boundary_payloads.append(
+            {
+                "points": torch.as_tensor(boundary_points, dtype=torch.float32, device=device),
+                "values": torch.as_tensor(boundary_values, dtype=torch.float32, device=device),
+            }
+        )
+    return cached_train_payloads, cached_boundary_payloads
+
+
+def average_multiload_fit_losses_cached(net, args, device, cached_train_payloads, cached_boundary_payloads):
+    data_terms = []
+    boundary_terms = []
+    for load_index, (train_payload, boundary_payload) in enumerate(zip(cached_train_payloads, cached_boundary_payloads)):
+        ux_idx, uy_idx = compact_state_indices(args, load_index)
+        observation_prediction = net(train_payload["points"])[:, [ux_idx, uy_idx]]
+        boundary_prediction = net(boundary_payload["points"])[:, [ux_idx, uy_idx]]
+        data_terms.append(mean_squared_error(observation_prediction, train_payload["values"]))
+        boundary_terms.append(mean_squared_error(boundary_prediction, boundary_payload["values"]))
+    data_mse = torch.mean(torch.stack(data_terms)) if data_terms else torch.zeros((), dtype=torch.float32, device=device)
+    boundary_mse = (
+        torch.mean(torch.stack(boundary_terms)) if boundary_terms else torch.zeros((), dtype=torch.float32, device=device)
+    )
+    return data_mse, boundary_mse
+
+
+def create_stage_points_tensor(points, device):
+    return torch.as_tensor(points, dtype=torch.float32, device=device)
+
+
+def init_validation_history():
+    return {
+        "metric_name": "validation_observation_mse",
+        "steps": [],
+        "validation_observation_mse": [],
+    }
+
+
+def update_best_validation_checkpoint(model, save_dir, step, current_value, history, best_state, verbose=1):
+    history["steps"].append(int(step))
+    history["validation_observation_mse"].append(float(current_value))
+    save_validation_history(history, save_dir)
+    if not np.isfinite(current_value) or current_value >= float(best_state["best"]):
+        return
+    if best_state.get("best_file") and os.path.exists(best_state["best_file"]):
+        try:
+            os.remove(best_state["best_file"])
+        except OSError:
+            pass
+    model_dir = os.path.join(save_dir, "model")
+    os.makedirs(model_dir, exist_ok=True)
+    previous_best = float(best_state["best"])
+    save_path = model.save(os.path.join(model_dir, "best_model"), verbose=0)
+    best_state["best"] = float(current_value)
+    best_state["best_file"] = save_path
+    best_state["best_step"] = int(step)
+    info = {
+        "step": int(step),
+        "monitor": "validation_observation_mse",
+        "best_value": float(current_value),
+        "loss_train_components": [float(x) for x in model.train_state.loss_train],
+        "loss_test_components": [float(x) for x in model.train_state.loss_test]
+        if model.train_state.loss_test is not None and len(model.train_state.loss_test) > 0
+        else [],
+        "model_path": os.path.basename(save_path),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json(os.path.join(save_dir, "json", "best_validation_info.json"), info)
+    if verbose > 0:
+        prev_text = "inf" if not np.isfinite(previous_best) else f"{previous_best:.2e}"
+        print(
+            "Epoch {}: validation_observation_mse improved from {} to {:.2e}, saving model to {} ...\n".format(
+                int(step),
+                prev_text,
+                float(current_value),
+                save_path,
+            )
+        )
 
 
 def split_iterations(total_iterations, num_chunks):
@@ -343,7 +473,7 @@ def extract_material_stage_points(data, geom, seed, fallback_count, max_points=N
 
 def compute_compact_material_stage_terms(net, domain_points, case_config, reg_weight, usage_floor, args):
     device = next(net.parameters()).device
-    x = torch.tensor(domain_points, dtype=torch.float32, device=device, requires_grad=True)
+    x = create_stage_points_tensor(domain_points, device).detach().clone().requires_grad_(True)
     raw = net(x)
     lambda_idx, mu_idx = compact_material_indices(args)
     lmbd = raw[:, lambda_idx:lambda_idx + 1]
@@ -442,6 +572,14 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
     save_array_txt(os.path.join(save_dir, "txt", "geometry_stage_points.txt"), stage_points, "x y")
 
     device = next(net.parameters()).device
+    stage_points_tensor = create_stage_points_tensor(stage_points, device)
+    cached_train_payloads, cached_boundary_payloads = prepare_multiload_fit_tensors(
+        metadata,
+        args,
+        device,
+        target_kind="noisy",
+        seed=args.seed + 913,
+    )
     state_frozen = bool(args.freeze_state_geometry_stage)
     region_frozen = bool(args.freeze_region_geometry_stage)
     if hasattr(net, "state_net"):
@@ -465,14 +603,20 @@ def run_geometry_stage(args, net, geom, data, case_config, metadata, save_dir):
         optimizer.zero_grad()
         terms = compute_compact_material_stage_terms(
             net=net,
-            domain_points=stage_points,
+            domain_points=stage_points_tensor,
             case_config=case_config,
             reg_weight=args.reg_weight,
             usage_floor=args.material_stage_usage_floor,
             args=args,
         )
 
-        data_mse, boundary_mse = average_multiload_fit_losses(net, metadata, args, device, target_kind="noisy")
+        data_mse, boundary_mse = average_multiload_fit_losses_cached(
+            net,
+            args,
+            device,
+            cached_train_payloads,
+            cached_boundary_payloads,
+        )
 
         if terms["mean_class_probs"].numel() >= 2:
             balance_penalty = torch.mean(
@@ -575,6 +719,8 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
     np.savez(os.path.join(save_dir, "npz", "material_stage_points.npz"), points=stage_points)
     save_array_txt(os.path.join(save_dir, "txt", "material_stage_points.txt"), stage_points, "x y")
 
+    device = next(net.parameters()).device
+    stage_points_tensor = create_stage_points_tensor(stage_points, device)
     state_frozen = bool(args.freeze_state_material_stage)
     if state_frozen and hasattr(net, "state_net"):
         set_requires_grad(net.state_net, False)
@@ -596,7 +742,7 @@ def run_material_stage(args, net, geom, data, case_config, save_dir):
         optimizer.zero_grad()
         terms = compute_compact_material_stage_terms(
             net=net,
-            domain_points=stage_points,
+            domain_points=stage_points_tensor,
             case_config=case_config,
             reg_weight=args.reg_weight,
             usage_floor=args.material_stage_usage_floor,
@@ -707,6 +853,8 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
     schedule_rows = []
     losshistory = None
     train_state = None
+    validation_history = init_validation_history()
+    best_validation_state = {"best": float("inf"), "best_file": None, "best_step": 0}
     physics_start = float(args.main_stage_physics_scale_start)
     physics_end = float(args.main_stage_physics_scale_end)
     reg_start = float(args.main_stage_reg_scale_start)
@@ -748,7 +896,13 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
                 boundary_scale=boundary_scale,
             ),
         )
-        callbacks = make_callbacks(args, save_dir, metadata)
+        callbacks = make_callbacks(
+            args,
+            save_dir,
+            metadata,
+            include_history=bool(getattr(args, "adaptive_main_full_callbacks", False)),
+            include_checkpoint=False,
+        )
         losshistory, train_state = model.train(
             iterations=chunk_iterations,
             display_every=max(100, min(args.display_every, chunk_iterations)),
@@ -759,6 +913,15 @@ def run_main_stage_with_correction_schedule(args, model, net, metadata, save_dir
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
         current_step += int(chunk_iterations)
+        update_best_validation_checkpoint(
+            model,
+            save_dir,
+            current_step,
+            val_mse,
+            validation_history,
+            best_validation_state,
+            verbose=1,
+        )
         region_summary = {}
         if hasattr(net, "predict_material_diagnostics"):
             with torch.no_grad():
@@ -820,6 +983,11 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
         stage_points = stage_points[: args.adaptive_main_domain_points]
     np.savez(os.path.join(save_dir, "npz", "adaptive_main_stage_points.npz"), points=stage_points)
     save_array_txt(os.path.join(save_dir, "txt", "adaptive_main_stage_points.txt"), stage_points, "x y")
+    signal_points = stage_points
+    signal_point_limit = int(getattr(args, "adaptive_main_signal_points", 0))
+    if signal_point_limit > 0 and len(signal_points) > signal_point_limit:
+        rng = np.random.default_rng(args.seed + 1801)
+        signal_points = signal_points[rng.choice(len(signal_points), size=signal_point_limit, replace=False)]
 
     chunk_sizes = split_iterations(main_iterations, args.adaptive_main_chunks)
     strategy = str(getattr(args, "adaptive_main_strategy", "val_feedback")).strip().lower()
@@ -857,10 +1025,23 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
     history_rows = []
     losshistory = None
     train_state = None
+    validation_history = init_validation_history()
+    best_validation_state = {"best": float("inf"), "best_file": None, "best_step": 0}
     current_step = int(
         max(getattr(args, "warmup_iterations", 0), 0)
         + max(getattr(args, "geometry_stage_iterations", 0), 0)
         + max(getattr(args, "material_stage_iterations", 0), 0)
+    )
+    device = next(net.parameters()).device
+    signal_points_tensor = create_stage_points_tensor(signal_points, device)
+    cached_signal_train_payloads, cached_signal_boundary_payloads = prepare_multiload_fit_tensors(
+        metadata,
+        args,
+        device,
+        target_kind="noisy",
+        train_limit=getattr(args, "adaptive_main_signal_observe_points", 0),
+        boundary_limit=getattr(args, "adaptive_main_signal_boundary_points", 0),
+        seed=args.seed + 1901,
     )
 
     for chunk_idx, chunk_iterations in enumerate(chunk_sizes, start=1):
@@ -880,7 +1061,13 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             data_scale=data_scale,
         )
         model.compile("adam", lr=chunk_lr, loss_weights=weights)
-        callbacks = make_callbacks(args, save_dir, metadata)
+        callbacks = make_callbacks(
+            args,
+            save_dir,
+            metadata,
+            include_history=bool(getattr(args, "adaptive_main_full_callbacks", False)),
+            include_checkpoint=False,
+        )
         losshistory, train_state = model.train(
             iterations=chunk_iterations,
             display_every=max(100, min(args.display_every, chunk_iterations)),
@@ -892,16 +1079,25 @@ def run_adaptive_main_stage(args, model, net, geom, data, case_config, metadata,
             model, args, metadata["val_observation"]["points"], metadata["val_observation"]["noisy"]
         )
         current_step += int(chunk_iterations)
-        data_mse_t, boundary_mse_t = average_multiload_fit_losses(
+        update_best_validation_checkpoint(
+            model,
+            save_dir,
+            current_step,
+            val_mse,
+            validation_history,
+            best_validation_state,
+            verbose=1,
+        )
+        data_mse_t, boundary_mse_t = average_multiload_fit_losses_cached(
             net,
-            metadata,
             args,
-            device=next(net.parameters()).device,
-            target_kind="noisy",
+            device,
+            cached_signal_train_payloads,
+            cached_signal_boundary_payloads,
         )
         terms = compute_compact_material_stage_terms(
             net=net,
-            domain_points=stage_points,
+            domain_points=signal_points_tensor,
             case_config=case_config,
             reg_weight=args.reg_weight,
             usage_floor=args.material_stage_usage_floor,
@@ -1172,7 +1368,11 @@ def main():
                     "adaptive_main_reg_scale": args.adaptive_main_reg_scale,
                     "adaptive_main_data_scale": args.adaptive_main_data_scale,
                     "adaptive_main_boundary_scale": args.adaptive_main_boundary_scale,
+                    "adaptive_main_signal_points": args.adaptive_main_signal_points,
+                    "adaptive_main_signal_observe_points": args.adaptive_main_signal_observe_points,
+                    "adaptive_main_signal_boundary_points": args.adaptive_main_signal_boundary_points,
                     "adaptive_main_strategy": args.adaptive_main_strategy,
+                    "adaptive_main_full_callbacks": args.adaptive_main_full_callbacks,
                     "adaptive_main_scale_ema": args.adaptive_main_scale_ema,
                     "adaptive_main_min_data_scale": args.adaptive_main_min_data_scale,
                     "adaptive_main_max_data_scale": args.adaptive_main_max_data_scale,
