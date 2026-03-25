@@ -35,6 +35,8 @@ from shared import (
     resolve_load_specs,
 )
 
+from utils.device_utils import enforce_and_report_runtime_device
+
 
 def parse_args():
     parser = build_common_parser("Train material-field inverse models")
@@ -1075,6 +1077,7 @@ def main():
     geom, data, metadata = build_data(args, case_config)
     model, net = build_model(args, data)
     initialize_geometry_parameters(args, net)
+    enforce_and_report_runtime_device(net, save_dir=args.save_dir, require_cuda=not getattr(args, "allow_cpu", False))
 
     if hasattr(data, "train_x_all") and data.train_x_all is not None:
         train_x_all = np.asarray(data.train_x_all)

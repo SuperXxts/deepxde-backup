@@ -2,7 +2,9 @@
 设备相关的工具函数
 用于检查GPU/CPU等设备信息，以及设置随机种子
 """
+import json
 import os
+
 import deepxde as dde
 
 
@@ -72,6 +74,91 @@ def print_gpu_info():
     
     print("=" * 60)
     print()
+
+
+def enforce_and_report_runtime_device(net=None, save_dir=None, require_cuda=True):
+    """
+    显式绑定 PyTorch/DCU 设备，并将运行时设备信息写入日志/JSON。
+    """
+    info = {
+        "backend": dde.backend.backend_name,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "rocr_visible_devices": os.environ.get("ROCR_VISIBLE_DEVICES"),
+        "hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"),
+        "ld_library_path": os.environ.get("LD_LIBRARY_PATH"),
+        "rocm_path": os.environ.get("ROCM_PATH"),
+        "hip_path": os.environ.get("HIP_PATH"),
+        "cuda_available": False,
+        "device_count": 0,
+        "device_name": None,
+        "runtime_probe_device": None,
+        "first_param_device": None,
+        "first_buffer_device": None,
+        "memory_allocated": None,
+    }
+
+    if dde.backend.backend_name != "pytorch":
+        if save_dir is not None:
+            os.makedirs(os.path.join(save_dir, "json"), exist_ok=True)
+            with open(os.path.join(save_dir, "json", "device_runtime.json"), "w", encoding="utf-8") as f:
+                json.dump(info, f, ensure_ascii=False, indent=2)
+        return info
+
+    import torch
+
+    info["cuda_available"] = bool(torch.cuda.is_available())
+    info["device_count"] = int(torch.cuda.device_count()) if info["cuda_available"] else 0
+    if info["cuda_available"] and info["device_count"] > 0:
+        torch.cuda.set_device(0)
+        info["device_name"] = torch.cuda.get_device_name(0)
+        probe = torch.zeros((1,), device="cuda")
+        info["runtime_probe_device"] = str(probe.device)
+        if net is not None and hasattr(net, "to"):
+            net.to("cuda")
+        if net is not None:
+            try:
+                first_param = next(net.parameters())
+                info["first_param_device"] = str(first_param.device)
+            except StopIteration:
+                info["first_param_device"] = None
+            try:
+                first_buffer = next(net.buffers())
+                info["first_buffer_device"] = str(first_buffer.device)
+            except StopIteration:
+                info["first_buffer_device"] = None
+        info["memory_allocated"] = int(torch.cuda.memory_allocated())
+    elif require_cuda:
+        raise RuntimeError("torch.cuda.is_available() is False. Current run is not using DCU/GPU.")
+
+    print("=" * 60)
+    print("Runtime Device Check:")
+    for key in [
+        "backend",
+        "cuda_visible_devices",
+        "rocr_visible_devices",
+        "hip_visible_devices",
+        "cuda_available",
+        "device_count",
+        "device_name",
+        "runtime_probe_device",
+        "first_param_device",
+        "first_buffer_device",
+        "memory_allocated",
+    ]:
+        print(f"  {key}: {info[key]}")
+    print("=" * 60)
+    print()
+
+    if require_cuda and info["cuda_available"]:
+        param_device = info.get("first_param_device")
+        if param_device is None or not param_device.startswith("cuda"):
+            raise RuntimeError(f"Model parameters are not on DCU/GPU. first_param_device={param_device}")
+
+    if save_dir is not None:
+        os.makedirs(os.path.join(save_dir, "json"), exist_ok=True)
+        with open(os.path.join(save_dir, "json", "device_runtime.json"), "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=2)
+    return info
 
 
 def set_random_seed(seed):
