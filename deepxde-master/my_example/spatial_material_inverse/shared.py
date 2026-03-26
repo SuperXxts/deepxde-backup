@@ -680,6 +680,193 @@ class VanillaMaterialFieldNet(dde.nn.pytorch.nn.NN):
         return outputs
 
 
+def material_outputs_from_raw(raw_outputs, lambda_floor, mu_floor, k_floor=0.2, parameterization="bulkmu"):
+    parameterization = str(parameterization).lower()
+    if parameterization == "bulkmu":
+        bulk = k_floor + F.softplus(raw_outputs[:, 0:1])
+        mu = mu_floor + F.softplus(raw_outputs[:, 1:2])
+        lmbd = torch.clamp(bulk - (2.0 / 3.0) * mu, min=lambda_floor)
+        return lmbd, mu
+    if parameterization == "lamemu":
+        lmbd = lambda_floor + F.softplus(raw_outputs[:, 0:1])
+        mu = mu_floor + F.softplus(raw_outputs[:, 1:2])
+        return lmbd, mu
+    raise ValueError(f"Unsupported material parameterization: {parameterization}")
+
+
+class TwoBranchCompactMaterialFieldNet(dde.nn.pytorch.nn.NN):
+    def __init__(
+        self,
+        num_loads,
+        state_hidden_layers,
+        material_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        k_floor=0.2,
+        parameterization="bulkmu",
+        backbone_type="mlp",
+    ):
+        super().__init__()
+        self.num_loads = int(num_loads)
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.k_floor = float(k_floor)
+        self.parameterization = str(parameterization)
+        self.features = FourierFeatureMap(num_frequencies)
+        feature_dim = self.features.output_dim
+        self.state_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=state_hidden_layers,
+            output_dim=2 * self.num_loads,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+        self.material_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=material_hidden_layers,
+            output_dim=2,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        state_outputs = self.state_net(features)
+        lmbd, mu = material_outputs_from_raw(
+            self.material_net(features),
+            lambda_floor=self.lambda_floor,
+            mu_floor=self.mu_floor,
+            k_floor=self.k_floor,
+            parameterization=self.parameterization,
+        )
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
+
+
+class TwoBranchStressMaterialFieldNet(dde.nn.pytorch.nn.NN):
+    def __init__(
+        self,
+        num_loads,
+        state_hidden_layers,
+        material_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        k_floor=0.2,
+        parameterization="bulkmu",
+        backbone_type="mlp",
+    ):
+        super().__init__()
+        self.num_loads = int(num_loads)
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.k_floor = float(k_floor)
+        self.parameterization = str(parameterization)
+        self.features = FourierFeatureMap(num_frequencies)
+        feature_dim = self.features.output_dim
+        self.state_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=state_hidden_layers,
+            output_dim=5 * self.num_loads,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+        self.material_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=material_hidden_layers,
+            output_dim=2,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        state_outputs = self.state_net(features)
+        lmbd, mu = material_outputs_from_raw(
+            self.material_net(features),
+            lambda_floor=self.lambda_floor,
+            mu_floor=self.mu_floor,
+            k_floor=self.k_floor,
+            parameterization=self.parameterization,
+        )
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
+
+
+class FiveStateMLPStressMaterialFieldNet(dde.nn.pytorch.nn.NN):
+    def __init__(
+        self,
+        num_loads,
+        state_hidden_layers,
+        material_hidden_layers,
+        activation="tanh",
+        num_frequencies=0,
+        lambda_floor=0.1,
+        mu_floor=0.1,
+        k_floor=0.2,
+        parameterization="bulkmu",
+        backbone_type="mlp",
+    ):
+        super().__init__()
+        self.num_loads = int(num_loads)
+        self.lambda_floor = float(lambda_floor)
+        self.mu_floor = float(mu_floor)
+        self.k_floor = float(k_floor)
+        self.parameterization = str(parameterization)
+        self.features = FourierFeatureMap(num_frequencies)
+        feature_dim = self.features.output_dim
+        self.ux_net = build_backbone(feature_dim, state_hidden_layers, self.num_loads, activation=activation, backbone_type=backbone_type)
+        self.uy_net = build_backbone(feature_dim, state_hidden_layers, self.num_loads, activation=activation, backbone_type=backbone_type)
+        self.sxx_net = build_backbone(feature_dim, state_hidden_layers, self.num_loads, activation=activation, backbone_type=backbone_type)
+        self.syy_net = build_backbone(feature_dim, state_hidden_layers, self.num_loads, activation=activation, backbone_type=backbone_type)
+        self.sxy_net = build_backbone(feature_dim, state_hidden_layers, self.num_loads, activation=activation, backbone_type=backbone_type)
+        self.material_net = build_backbone(
+            input_dim=feature_dim,
+            hidden_layers=material_hidden_layers,
+            output_dim=2,
+            activation=activation,
+            backbone_type=backbone_type,
+        )
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        features = self.features(x)
+        ux_all = self.ux_net(features)
+        uy_all = self.uy_net(features)
+        sxx_all = self.sxx_net(features)
+        syy_all = self.syy_net(features)
+        sxy_all = self.sxy_net(features)
+        state_chunks = []
+        for load_index in range(self.num_loads):
+            state_chunks.extend(
+                [
+                    ux_all[:, load_index:load_index + 1],
+                    uy_all[:, load_index:load_index + 1],
+                    sxx_all[:, load_index:load_index + 1],
+                    syy_all[:, load_index:load_index + 1],
+                    sxy_all[:, load_index:load_index + 1],
+                ]
+            )
+        state_outputs = torch.cat(state_chunks, dim=1)
+        lmbd, mu = material_outputs_from_raw(
+            self.material_net(features),
+            lambda_floor=self.lambda_floor,
+            mu_floor=self.mu_floor,
+            k_floor=self.k_floor,
+            parameterization=self.parameterization,
+        )
+        return torch.cat((state_outputs, lmbd, mu), dim=1)
+
+
 def num_regions_for_case(case_name):
     if case_name in {"layered", "single_inclusion"}:
         return 1
@@ -1021,7 +1208,7 @@ def count_trainable_parameters(net):
 
 
 def is_compact_material_method(method):
-    return method in {"iaminn_v2", "geoiaminn", "geoiaminn_v3"}
+    return method in {"iaminn_v2", "geoiaminn", "geoiaminn_v3", "twobranch_compact_kmu"}
 
 
 def build_network(args):
@@ -1062,6 +1249,45 @@ def build_network(args):
             mu_floor=args.mu_floor,
             k_floor=args.k_floor,
             interface_sharpness=args.interface_sharpness,
+            parameterization=args.material_parameterization,
+            backbone_type=args.backbone_type,
+        )
+    elif args.method == "twobranch_compact_kmu":
+        net = TwoBranchCompactMaterialFieldNet(
+            num_loads=num_loads,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            material_hidden_layers=parse_hidden_layers(args.material_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            k_floor=args.k_floor,
+            parameterization=args.material_parameterization,
+            backbone_type=args.backbone_type,
+        )
+    elif args.method == "twobranch_stress_kmu":
+        net = TwoBranchStressMaterialFieldNet(
+            num_loads=num_loads,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            material_hidden_layers=parse_hidden_layers(args.material_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            k_floor=args.k_floor,
+            parameterization=args.material_parameterization,
+            backbone_type=args.backbone_type,
+        )
+    elif args.method == "fivestate_stress_kmu":
+        net = FiveStateMLPStressMaterialFieldNet(
+            num_loads=num_loads,
+            state_hidden_layers=parse_hidden_layers(args.state_layers),
+            material_hidden_layers=parse_hidden_layers(args.material_layers),
+            activation=args.activation,
+            num_frequencies=args.num_frequencies,
+            lambda_floor=args.lambda_floor,
+            mu_floor=args.mu_floor,
+            k_floor=args.k_floor,
             parameterization=args.material_parameterization,
             backbone_type=args.backbone_type,
         )
@@ -1413,6 +1639,9 @@ def default_experiment_group(method):
         "iaminn_v2": "IAMINN-v2",
         "geoiaminn": "GeoIAMINN",
         "geoiaminn_v3": "GeoIAMINN-v3",
+        "twobranch_compact_kmu": "TwoBranch-KMu",
+        "twobranch_stress_kmu": "TwoBranch-Stress-KMu",
+        "fivestate_stress_kmu": "FiveState-Stress-KMu",
     }
     return mapping.get(method, method.upper())
 
@@ -2182,7 +2411,7 @@ def build_common_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument(
         "--method",
-        choices=["pinn", "iaminn_v2", "geoiaminn", "geoiaminn_v3"],
+        choices=["pinn", "iaminn_v2", "geoiaminn", "geoiaminn_v3", "twobranch_compact_kmu", "twobranch_stress_kmu", "fivestate_stress_kmu"],
         default="pinn",
     )
     parser.add_argument(
@@ -2210,6 +2439,7 @@ def build_common_parser(description):
     parser.add_argument("--backbone_type", choices=["mlp", "resmlp"], default="mlp")
     parser.add_argument("--hidden_layers", type=str, default="128,128,128,128")
     parser.add_argument("--state_layers", type=str, default="128,128,128,128")
+    parser.add_argument("--material_layers", type=str, default="128,128,128,128")
     parser.add_argument("--geometry_layers", type=str, default="64,64,64")
     parser.add_argument("--interface_layers", type=str, default="128,128,128,128")
     parser.add_argument("--interface_sharpness", type=float, default=10.0)
