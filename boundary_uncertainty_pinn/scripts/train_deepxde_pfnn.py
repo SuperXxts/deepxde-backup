@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""DeepXDE PFNN runner for boundary-misinformation inversion experiments."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+os.environ.setdefault("DDE_BACKEND", "pytorch")
+
+
+CASE_CHOICES = (
+    "oracle_A",
+    "wrong_fixed_A",
+    "learnable_A",
+    "learnable_A_anchor",
+    "learnable_A_reaction",
+    "full_boundary_aware",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--case", default="learnable_A", choices=CASE_CHOICES)
+    parser.add_argument("--iterations", type=int, default=1000)
+    parser.add_argument("--display-every", type=int, default=100)
+    parser.add_argument("--num-domain", type=int, default=500)
+    parser.add_argument("--num-boundary", type=int, default=160)
+    parser.add_argument("--obs-grid", type=int, default=8)
+    parser.add_argument("--test-grid", type=int, default=101)
+    parser.add_argument("--anchor-count", type=int, default=4)
+    parser.add_argument("--reaction-points", type=int, default=100)
+    parser.add_argument("--noise-level", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--width", type=int, default=64)
+    parser.add_argument("--depth", type=int, default=4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--nu", type=float, default=0.30)
+    parser.add_argument("--true-A", type=float, default=1.0)
+    parser.add_argument("--init-A", type=float, default=0.85)
+    parser.add_argument("--fixed-A", type=float, default=0.85)
+    parser.add_argument(
+        "--deepxde-root",
+        type=Path,
+        default=Path("/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/deepxde-master"),
+    )
+    return parser.parse_args()
+
+
+def add_paths(args: argparse.Namespace) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(project_root / "src"))
+    if args.deepxde_root.exists():
+        sys.path.insert(0, str(args.deepxde_root))
+
+
+def main() -> None:
+    args = parse_args()
+    add_paths(args)
+
+    import deepxde as dde
+    import numpy as np
+    import torch
+
+    from bupinn import analytical
+    from bupinn.io import ensure_run_dirs, save_table, write_json
+    from bupinn.plotting import (
+        plot_amplitude_history,
+        plot_boundary_curve,
+        plot_field_triplet,
+        plot_line_slice,
+        plot_loss_history,
+        plot_sampling,
+    )
+
+    dirs = ensure_run_dirs(args.run_dir)
+    np.random.seed(args.seed)
+    dde.config.set_random_seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
+    pi = np.pi
+    k0 = 1.0 / (3.0 * (1.0 - 2.0 * args.nu))
+    mu0 = 1.0 / (2.0 * (1.0 + args.nu))
+
+    def lambda_from_k_mu(k, mu):
+        return k - 2.0 * mu / 3.0
+
+    def bkd_material_factor(x):
+        xp = x[:, 0:1]
+        yp = x[:, 1:2]
+        layer = 1.0 + 0.22 * torch.tanh((yp - 0.55) / 0.045)
+        lens_soft = -0.18 * torch.exp(-((xp - 0.68) ** 2 / 0.018 + (yp - 0.35) ** 2 / 0.012))
+        lens_stiff = 0.16 * torch.exp(-((xp - 0.32) ** 2 / 0.012 + (yp - 0.72) ** 2 / 0.018))
+        ripple = 0.04 * torch.sin(2.0 * pi * xp) * torch.sin(pi * yp)
+        return torch.clamp(layer + lens_soft + lens_stiff + ripple, 0.45, 1.65)
+
+    def bkd_displacement_derivatives(x, amplitude):
+        xp = x[:, 0:1]
+        yp = x[:, 1:2]
+        dux_dx = 0.05 * pi * torch.cos(pi * xp) * torch.sin(pi * yp) * (1.0 - yp)
+        dux_dy = 0.05 * torch.sin(pi * xp) * (pi * torch.cos(pi * yp) * (1.0 - yp) - torch.sin(pi * yp))
+        duy_dx = yp * (0.04 * pi * torch.cos(pi * xp) + 0.04 * pi * torch.cos(2.0 * pi * xp) * yp)
+        duy_dy = 0.15 + 0.04 * torch.sin(pi * xp) + 0.04 * torch.sin(2.0 * pi * xp) * yp
+        exx = amplitude * dux_dx
+        eyy = amplitude * duy_dy
+        exy = 0.5 * amplitude * (dux_dy + duy_dx)
+        return exx, eyy, exy
+
+    def stress_from_k_mu(k, mu, exx, eyy, exy):
+        lam = lambda_from_k_mu(k, mu)
+        sxx = (2.0 * mu + lam) * exx + lam * eyy
+        syy = lam * exx + (2.0 * mu + lam) * eyy
+        sxy = 2.0 * mu * exy
+        return sxx, syy, sxy
+
+    def true_stress_torch(x):
+        factor = bkd_material_factor(x)
+        k_true = k0 * factor
+        mu_true = mu0 * factor
+        exx, eyy, exy = bkd_displacement_derivatives(x, args.true_A)
+        sxx, syy, sxy = stress_from_k_mu(k_true, mu_true, exx, eyy, exy)
+        return torch.cat([sxx, syy, sxy], dim=1)
+
+    def body_force(x):
+        sig = true_stress_torch(x)
+        sxx_x = dde.grad.jacobian(sig, x, i=0, j=0)
+        sxy_y = dde.grad.jacobian(sig, x, i=2, j=1)
+        sxy_x = dde.grad.jacobian(sig, x, i=2, j=0)
+        syy_y = dde.grad.jacobian(sig, x, i=1, j=1)
+        return sxx_x + sxy_y, sxy_x + syy_y
+
+    def jacobian(y, x, i, j):
+        return dde.grad.jacobian(y, x, i=i, j=j)
+
+    def pde(x, y):
+        ux_x = jacobian(y, x, 0, 0)
+        uy_y = jacobian(y, x, 1, 1)
+        ux_y = jacobian(y, x, 0, 1)
+        uy_x = jacobian(y, x, 1, 0)
+        exx = ux_x
+        eyy = uy_y
+        exy = 0.5 * (ux_y + uy_x)
+
+        k_pred = k0 * torch.exp(torch.clamp(y[:, 5:6], min=-3.0, max=3.0))
+        mu_pred = mu0 * torch.exp(torch.clamp(y[:, 6:7], min=-3.0, max=3.0))
+        sxx_c, syy_c, sxy_c = stress_from_k_mu(k_pred, mu_pred, exx, eyy, exy)
+
+        sxx_x = jacobian(y, x, 2, 0)
+        syy_y = jacobian(y, x, 3, 1)
+        sxy_x = jacobian(y, x, 4, 0)
+        sxy_y = jacobian(y, x, 4, 1)
+        fx, fy = body_force(x)
+        return [
+            sxx_x + sxy_y - fx,
+            sxy_x + syy_y - fy,
+            sxx_c - y[:, 2:3],
+            syy_c - y[:, 3:4],
+            sxy_c - y[:, 4:5],
+        ]
+
+    def top_shape_torch(x):
+        xp = x[:, 0:1]
+        return 0.15 + 0.04 * torch.sin(pi * xp) + 0.02 * torch.sin(2.0 * pi * xp)
+
+    def boundary_bottom(x, on_boundary):
+        return on_boundary and dde.utils.isclose(x[1], 0.0)
+
+    def boundary_top(x, on_boundary):
+        return on_boundary and dde.utils.isclose(x[1], 1.0)
+
+    uses_trainable_a = args.case in {"learnable_A", "learnable_A_anchor", "learnable_A_reaction", "full_boundary_aware"}
+    uses_anchor = args.case in {"learnable_A_anchor", "full_boundary_aware"}
+    uses_reaction = args.case in {"learnable_A_reaction", "full_boundary_aware"}
+
+    if uses_trainable_a:
+        amplitude_var = dde.Variable(args.init_A)
+        external_vars = [amplitude_var]
+        amplitude_for_bc = amplitude_var
+    elif args.case == "oracle_A":
+        amplitude_var = None
+        external_vars = []
+        amplitude_for_bc = float(args.true_A)
+    else:
+        amplitude_var = None
+        external_vars = []
+        amplitude_for_bc = float(args.fixed_A)
+
+    def top_uy_bc(inputs, outputs, _X):
+        return outputs[:, 1:2] - amplitude_for_bc * top_shape_torch(inputs)
+
+    def top_ux_bc(inputs, outputs, _X):
+        return outputs[:, 0:1]
+
+    bcs = [
+        dde.icbc.DirichletBC(geom, lambda x: 0.0, boundary_bottom, component=0),
+        dde.icbc.DirichletBC(geom, lambda x: 0.0, boundary_bottom, component=1),
+        dde.icbc.OperatorBC(geom, top_ux_bc, boundary_top),
+        dde.icbc.OperatorBC(geom, top_uy_bc, boundary_top),
+    ]
+
+    obs_x = analytical.make_grid(args.obs_grid, include_boundary=False)
+    obs_u = analytical.add_noise(analytical.displacement(obs_x, args.true_A), args.noise_level, args.seed)
+    bcs.append(dde.icbc.PointSetBC(obs_x, obs_u, component=[0, 1]))
+
+    anchor_x = analytical.boundary_anchor_points(args.anchor_count if uses_anchor else 0)
+    anchor_u = analytical.displacement(anchor_x, args.true_A) if len(anchor_x) else np.empty((0, 2), dtype=np.float32)
+    if len(anchor_x):
+        bcs.append(dde.icbc.PointSetBC(anchor_x, anchor_u, component=[0, 1]))
+
+    reaction_x = np.column_stack(
+        [np.linspace(0.0, 1.0, max(2, args.reaction_points)), np.ones(max(2, args.reaction_points))]
+    ).astype(np.float32)
+    reaction_weights = np.ones((len(reaction_x), 1), dtype=np.float32) / max(1, len(reaction_x) - 1)
+    reaction_weights[0, 0] *= 0.5
+    reaction_weights[-1, 0] *= 0.5
+    true_reaction_density = analytical.stress_np(reaction_x, args.true_A, args.nu)[:, 1:2]
+    true_reaction_y = float(np.sum(true_reaction_density * reaction_weights))
+
+    if uses_reaction:
+        target_reaction = np.full((len(reaction_x), 1), true_reaction_y, dtype=np.float32)
+        point_lookup = {
+            tuple(np.round(pt, decimals=8).tolist()): float(reaction_weights[i, 0])
+            for i, pt in enumerate(reaction_x)
+        }
+
+        def reaction_operator(inputs, outputs, _X):
+            device = outputs.device
+            dtype = outputs.dtype
+            if torch.is_tensor(inputs):
+                x_np = inputs.detach().cpu().numpy()
+            else:
+                x_np = np.asarray(inputs, dtype=float)
+            weights_full = np.zeros((x_np.shape[0], 1), dtype=float)
+            rounded = np.round(x_np[:, :2], decimals=8)
+            for row_index, pt in enumerate(rounded):
+                weights_full[row_index, 0] = point_lookup.get(tuple(pt.tolist()), 0.0)
+            weights_t = torch.as_tensor(weights_full, dtype=dtype, device=device)
+            syy = outputs[:, 3:4]
+            resultant = torch.sum(syy * weights_t)
+            return torch.ones((outputs.shape[0], 1), dtype=dtype, device=device) * resultant
+
+        bcs.append(dde.icbc.PointSetOperatorBC(reaction_x, target_reaction, reaction_operator))
+
+    data = dde.data.PDE(
+        geom,
+        pde,
+        bcs,
+        num_domain=args.num_domain,
+        num_boundary=args.num_boundary,
+        train_distribution="Hammersley",
+        num_test=None,
+    )
+    layer_sizes = [2] + [[args.width] * 7 for _ in range(args.depth)] + [7]
+    net = dde.nn.PFNN(layer_sizes, "tanh", "Glorot normal")
+    model = dde.Model(data, net)
+    model.compile("adam", lr=args.lr, external_trainable_variables=external_vars)
+
+    class AmplitudeLogger(dde.callbacks.Callback):
+        def __init__(self, path: Path, period: int = 100):
+            super().__init__()
+            self.path = path
+            self.period = period
+            self.rows: list[tuple[int, float]] = []
+
+        def _value(self) -> float:
+            if amplitude_var is None:
+                return float(amplitude_for_bc)
+            return float(amplitude_var.detach().cpu().item())
+
+        def on_train_begin(self):
+            self.rows.append((0, self._value()))
+
+        def on_epoch_end(self):
+            step = int(self.model.train_state.iteration)
+            if step % self.period == 0:
+                value = self._value()
+                self.rows.append((step, value))
+                print(f"STEP {step} A {value:.8f}", flush=True)
+
+        def on_train_end(self):
+            arr = np.asarray(self.rows, dtype=float)
+            np.savetxt(self.path, arr, header="step A")
+
+    amp_log = AmplitudeLogger(dirs["dat"] / "amplitude_history.dat", period=max(1, args.display_every))
+    checkpoint = dde.callbacks.ModelCheckpoint(
+        str(dirs["model"] / "best_model"),
+        verbose=0,
+        save_better_only=True,
+        period=max(1, args.display_every),
+        monitor="train loss",
+    )
+
+    loss_terms = [
+        "momentum_x",
+        "momentum_y",
+        "constitutive_sxx",
+        "constitutive_syy",
+        "constitutive_sxy",
+        "bottom_ux",
+        "bottom_uy",
+        "top_ux",
+        "top_uy",
+        "obs_u",
+    ]
+    if uses_anchor:
+        loss_terms.append("anchor_u")
+    if uses_reaction:
+        loss_terms.append("global_reaction_y")
+
+    config = vars(args).copy()
+    config.update(
+        {
+            "backend": dde.backend.backend_name,
+            "torch_cuda_available": bool(torch.cuda.is_available()),
+            "torch_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
+            "network": {"type": "PFNN", "layer_sizes": layer_sizes},
+            "material_parameterization": "K=K0*exp(zK), mu=mu0*exp(zmu)",
+            "k0": float(k0),
+            "mu0": float(mu0),
+            "uses_anchor": bool(uses_anchor),
+            "uses_reaction": bool(uses_reaction),
+            "true_reaction_y": float(true_reaction_y),
+            "loss_terms": loss_terms,
+        }
+    )
+    write_json(dirs["json"] / "config.json", config)
+    plot_sampling(obs_x, anchor_x, dirs["png"] / "sampling_layout.png")
+    save_table(dirs["dat"] / "observation_points.dat", np.hstack([obs_x, obs_u]), "x y ux uy")
+    save_table(
+        dirs["dat"] / "reaction_points.dat",
+        np.hstack([reaction_x, reaction_weights, true_reaction_density]),
+        "x y integration_weight true_syy",
+    )
+    if len(anchor_x):
+        save_table(dirs["dat"] / "anchor_points.dat", np.hstack([anchor_x, anchor_u]), "x y ux uy")
+
+    start = time.time()
+    losshistory, train_state = model.train(
+        iterations=args.iterations,
+        display_every=args.display_every,
+        callbacks=[amp_log, checkpoint],
+    )
+    elapsed = time.time() - start
+    model.save(str(dirs["model"] / "final_model"))
+
+    plot_loss_history(losshistory, dirs["png"] / "loss_history.png", dirs["npz"] / "loss_history.npz")
+    plot_amplitude_history(dirs["dat"] / "amplitude_history.dat", dirs["png"] / "amplitude_history.png", args.true_A)
+
+    x_test = analytical.make_grid(args.test_grid, include_boundary=True)
+    pred_raw = model.predict(x_test)
+    pred_k = k0 * np.exp(np.clip(pred_raw[:, 5:6], -3.0, 3.0))
+    pred_mu = mu0 * np.exp(np.clip(pred_raw[:, 6:7], -3.0, 3.0))
+    pred_e = 9.0 * pred_k * pred_mu / (3.0 * pred_k + pred_mu)
+    pred_nu = (3.0 * pred_k - 2.0 * pred_mu) / (2.0 * (3.0 * pred_k + pred_mu))
+    pred = np.column_stack([pred_raw[:, 0:5], pred_k, pred_mu, pred_e, pred_nu])
+
+    true_basic = analytical.all_fields(x_test, args.true_A, args.nu)
+    true_e = true_basic[:, 5:6]
+    true_k = k0 * true_e
+    true_mu = mu0 * true_e
+    true_nu = np.full_like(true_e, args.nu)
+    true = np.column_stack([true_basic[:, 0:5], true_k, true_mu, true_e, true_nu])
+    names = ["ux", "uy", "sxx", "syy", "sxy", "K", "mu", "E", "nu"]
+    rel_l2 = {}
+    for i, name in enumerate(names):
+        denom = np.linalg.norm(true[:, i]) + 1e-12
+        rel_l2[name] = float(np.linalg.norm(pred[:, i] - true[:, i]) / denom)
+        plot_field_triplet(x_test, true[:, i], pred[:, i], name, dirs["png"] / f"field_{name}.png")
+    plot_line_slice(
+        x_test,
+        {"uy": (true[:, 1], pred[:, 1]), "K": (true[:, 5], pred[:, 5]), "mu": (true[:, 6], pred[:, 6])},
+        dirs["png"] / "slice_y_0p5.png",
+        y_value=0.5,
+    )
+
+    top_pred_raw = model.predict(reaction_x)
+    top_pred_reaction_density = top_pred_raw[:, 3:4]
+    pred_reaction_y = float(np.sum(top_pred_reaction_density * reaction_weights))
+    reaction_rel_error = abs(pred_reaction_y - true_reaction_y) / (abs(true_reaction_y) + 1e-12)
+    plot_boundary_curve(
+        reaction_x,
+        analytical.displacement(reaction_x, args.true_A)[:, 1],
+        top_pred_raw[:, 1],
+        "top uy",
+        dirs["png"] / "top_uy_curve.png",
+    )
+    plot_boundary_curve(
+        reaction_x,
+        true_reaction_density[:, 0],
+        top_pred_reaction_density[:, 0],
+        "top syy reaction density",
+        dirs["png"] / "top_reaction_density_curve.png",
+    )
+
+    np.savez(
+        dirs["npz"] / "eval_fields.npz",
+        x_test=x_test,
+        y_true=true,
+        y_pred=pred,
+        y_pred_raw=pred_raw,
+        obs_x=obs_x,
+        obs_u=obs_u,
+        anchor_x=anchor_x,
+        anchor_u=anchor_u,
+        reaction_x=reaction_x,
+        reaction_weights=reaction_weights,
+        true_reaction_y=true_reaction_y,
+        pred_reaction_y=pred_reaction_y,
+    )
+    final_A = amp_log.rows[-1][1] if amp_log.rows else float(amplitude_for_bc)
+    metrics = {
+        "case": args.case,
+        "iterations": args.iterations,
+        "elapsed_seconds": elapsed,
+        "final_A": float(final_A),
+        "true_A": float(args.true_A),
+        "relative_l2": rel_l2,
+        "true_reaction_y": float(true_reaction_y),
+        "pred_reaction_y": float(pred_reaction_y),
+        "reaction_rel_error": float(reaction_rel_error),
+        "best_step": int(train_state.best_step),
+        "final_train_loss_sum": float(np.sum(train_state.loss_train)),
+        "final_test_loss_sum": float(np.sum(train_state.loss_test)),
+    }
+    write_json(dirs["metrics"] / "metrics.json", metrics)
+    write_json(dirs["json"] / "training_summary.json", metrics)
+    print("RUN_COMPLETE", metrics, flush=True)
+
+
+if __name__ == "__main__":
+    main()
