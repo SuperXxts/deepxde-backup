@@ -1,0 +1,53 @@
+Ranking by mean(K, mu) relative L2 error:
+A15 KM_mean=0.0804913 K=0.0680041 mu=0.0929786
+A14 KM_mean=0.136458 K=0.113139 mu=0.159777
+A9 KM_mean=0.155546 K=0.107155 mu=0.203938
+A6 KM_mean=0.204779 K=0.199944 mu=0.209614
+A3 KM_mean=0.207807 K=0.162928 mu=0.252685
+A13 KM_mean=0.213945 K=0.206314 mu=0.221577
+A11 KM_mean=0.248615 K=0.214138 mu=0.283091
+A5 KM_mean=0.251665 K=0.255176 mu=0.248153
+A10 KM_mean=0.262187 K=0.248523 mu=0.275851
+A12 KM_mean=0.269445 K=0.227518 mu=0.311371
+A8 KM_mean=0.279312 K=0.258285 mu=0.30034
+A2 KM_mean=0.348518 K=0.445201 mu=0.251836
+A0 KM_mean=0.368632 K=0.494335 mu=0.242929
+A4 KM_mean=0.373782 K=0.489945 mu=0.257619
+A7 KM_mean=0.586133 K=0.78349 mu=0.388776
+A1 KM_mean=0.928931 K=1.47631 mu=0.381558
+
+Ranking by mean(K, mu, E, nu) relative L2 error:
+A15 material_mean=0.0830526
+A14 material_mean=0.141988
+A9 material_mean=0.166386
+A6 material_mean=0.215781
+A13 material_mean=0.216219
+A3 material_mean=0.217437
+A11 material_mean=0.252246
+A5 material_mean=0.259701
+A12 material_mean=0.277948
+A10 material_mean=0.292301
+A8 material_mean=0.307288
+A2 material_mean=0.482633
+A7 material_mean=0.505309
+A4 material_mean=0.508566
+A0 material_mean=0.51823
+A1 material_mean=0.827023
+
+Ranking by reaction-force relative error:
+A3 reaction=0.000201354
+A5 reaction=0.00145119
+A6 reaction=0.00156504
+A15 reaction=0.00193904
+A9 reaction=0.00215534
+A14 reaction=0.00392442
+A11 reaction=0.00430617
+A13 reaction=0.160505
+A12 reaction=0.192572
+A10 reaction=0.193989
+A8 reaction=0.213614
+A2 reaction=0.261386
+A7 reaction=0.266125
+A4 reaction=0.279831
+A0 reaction=0.30366
+A1 reaction=0.361072

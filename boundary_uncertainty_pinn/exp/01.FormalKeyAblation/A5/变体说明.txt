@@ -1,0 +1,1 @@
+PFNN_learnable_boundary_amplitude_with_anchors_and_reaction_formal150k

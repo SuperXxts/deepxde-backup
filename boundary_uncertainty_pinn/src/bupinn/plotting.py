@@ -223,6 +223,22 @@ def _contour(ax, xs: np.ndarray, ys: np.ndarray, z: np.ndarray, levels, cmap: st
     return ax.contourf(xs, ys, z, levels=levels, cmap=cmap, extend="both")
 
 
+def _format_field_axes(axes: np.ndarray) -> None:
+    axes_arr = np.asarray(axes)
+    if axes_arr.ndim == 1:
+        axes_arr = axes_arr.reshape(1, -1)
+    for row in range(axes_arr.shape[0]):
+        for col in range(axes_arr.shape[1]):
+            ax = axes_arr[row, col]
+            ax.set_xlabel(r"$x$")
+            if col == 0:
+                ax.set_ylabel(r"$y$")
+            else:
+                ax.set_ylabel("")
+                ax.tick_params(axis="y", labelleft=False)
+            ax.set_aspect("equal")
+
+
 def plot_field_triplet(x: np.ndarray, true: np.ndarray, pred: np.ndarray, name: str, out: Path) -> None:
     xs, ys, zt = _grid_field(x, true)
     _, _, zp = _grid_field(x, pred)
@@ -230,18 +246,15 @@ def plot_field_triplet(x: np.ndarray, true: np.ndarray, pred: np.ndarray, name: 
     shared_levels = _levels(zt, zp)
     err_levels = _levels(ze)
 
-    fig, axes = plt.subplots(1, 3, figsize=(12.0, 3.8))
+    fig, axes = plt.subplots(1, 3, figsize=(12.2, 3.8), constrained_layout=True)
     im0 = _contour(axes[0], xs, ys, zt, shared_levels, "viridis")
     axes[0].set_title("Reference")
     _contour(axes[1], xs, ys, zp, shared_levels, "viridis")
     axes[1].set_title("Prediction")
     im2 = _contour(axes[2], xs, ys, ze, err_levels, "magma")
     axes[2].set_title("Absolute error")
-    for ax in axes:
-        ax.set_xlabel(r"$x$")
-        ax.set_ylabel(r"$y$")
-        ax.set_aspect("equal")
-    fig.suptitle(_field_label(name), y=1.02)
+    _format_field_axes(axes)
+    fig.suptitle(_field_label(name))
     fig.colorbar(im0, ax=axes[:2], shrink=0.78)
     fig.colorbar(im2, ax=axes[2], shrink=0.78)
     save_figure_all(fig, out)
@@ -249,7 +262,7 @@ def plot_field_triplet(x: np.ndarray, true: np.ndarray, pred: np.ndarray, name: 
 
 
 def plot_k_mu_comparison(x: np.ndarray, truth: np.ndarray, pred: np.ndarray, out: Path) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(12.0, 7.4))
+    fig, axes = plt.subplots(2, 3, figsize=(12.2, 7.4), constrained_layout=True)
     for row, (idx, label) in enumerate([(5, "K"), (6, "mu")]):
         xs, ys, zt = _grid_field(x, truth[:, idx])
         _, _, zp = _grid_field(x, pred[:, idx])
@@ -264,10 +277,7 @@ def plot_k_mu_comparison(x: np.ndarray, truth: np.ndarray, pred: np.ndarray, out
         axes[row, 2].set_title(f"{_field_label(label)}: absolute error")
         fig.colorbar(im0, ax=axes[row, :2], shrink=0.76)
         fig.colorbar(im2, ax=axes[row, 2], shrink=0.76)
-    for ax in axes.ravel():
-        ax.set_xlabel(r"$x$")
-        ax.set_ylabel(r"$y$")
-        ax.set_aspect("equal")
+    _format_field_axes(axes)
     save_figure_all(fig, out)
     plt.close(fig)
 

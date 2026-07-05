@@ -1,0 +1,75 @@
+{
+  "best_step": 141000,
+  "case": "A8",
+  "elapsed_seconds": 22444.990698337555,
+  "equilibrium_form": "direct",
+  "eval_checkpoint": "best",
+  "eval_checkpoint_path": "/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn/exp/01.FormalKeyAblation/A8/model/final_model-150000.pt",
+  "final_A_or_beta0": 0.9951716065406799,
+  "final_beta": [
+    0.9951716065406799
+  ],
+  "final_model_path": "/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn/exp/01.FormalKeyAblation/A8/model/final_model-150000.pt",
+  "final_test_loss_sum": 1.28195206343662e-05,
+  "final_train_loss_sum": 1.28195206343662e-05,
+  "independent_test_loss_available": false,
+  "iterations": 150000,
+  "loss_history_interval": 1000,
+  "num_trainable_parameters": 29432,
+  "pred_reaction_y": 0.21800312399864197,
+  "pred_reaction_y_constitutive": 0.22020423412322998,
+  "pred_reaction_y_stress_branch": 0.21800312399864197,
+  "reaction_form": "stress",
+  "reaction_rel_error": 0.21361351665504721,
+  "reaction_rel_error_constitutive": 0.2056736155262332,
+  "reaction_rel_error_stress_branch": 0.21361351665504721,
+  "relative_l2": {
+    "E": 0.29328837991152684,
+    "K": 0.25828509549336937,
+    "mu": 0.300339779142573,
+    "nu": 0.377237857027456,
+    "sxx": 0.21064197307806043,
+    "sxy": 0.2662704150744081,
+    "syy": 0.20877547444102107,
+    "ux": 0.0836981135382468,
+    "uy": 0.007822069945540758
+  },
+  "run_note": "Split_network_learnable_boundary_amplitude_formal150k",
+  "split_relative_l2": {
+    "evaluation": {
+      "E": 0.29328837991152684,
+      "K": 0.25828509549336937,
+      "mu": 0.300339779142573,
+      "nu": 0.377237857027456,
+      "sxx": 0.21064197307806043,
+      "sxy": 0.2662704150744081,
+      "syy": 0.20877547444102107,
+      "ux": 0.0836981135382468,
+      "uy": 0.007822069945540758
+    },
+    "train": {
+      "E": 0.3060620296207863,
+      "K": 0.27519952762518823,
+      "mu": 0.3083257833879472,
+      "nu": 0.3823721923675764,
+      "sxx": 0.20918791505934115,
+      "sxy": 0.2504949667214106,
+      "syy": 0.21660071203996825,
+      "ux": 0.06325419181572733,
+      "uy": 0.006635966667056617
+    },
+    "validation": {
+      "E": 0.29922050756867863,
+      "K": 0.2667081169989145,
+      "mu": 0.30401930697385254,
+      "nu": 0.38117143667985415,
+      "sxx": 0.21023068796882033,
+      "sxy": 0.25881395563098497,
+      "syy": 0.21232858392893786,
+      "ux": 0.07315231145640028,
+      "uy": 0.006950125571646919
+    }
+  },
+  "true_A": 1.0,
+  "true_reaction_y": 0.27722135186195374
+}
