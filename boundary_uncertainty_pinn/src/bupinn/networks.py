@@ -28,6 +28,14 @@ class BoundaryMaterialPFNN(torch.nn.Module):
         init_beta: list[float] | None = None,
         trainable_boundary: bool = True,
         use_boundary_layer: bool = False,
+        boundary_mode_type: str = "unit_top",
+        domain_x_min: float = 0.0,
+        domain_x_max: float = 1.0,
+        domain_y_bottom: float = 0.0,
+        domain_y_top: float = 1.0,
+        plate_center: float | None = None,
+        plate_width: float | None = None,
+        boundary_mode_scale: float = 1.0,
     ):
         super().__init__()
         self._input_transform = None
@@ -35,6 +43,14 @@ class BoundaryMaterialPFNN(torch.nn.Module):
         self.regularizer = None
         self.num_boundary_modes = int(num_boundary_modes)
         self.use_boundary_layer = bool(use_boundary_layer and self.num_boundary_modes > 0)
+        self.boundary_mode_type = str(boundary_mode_type)
+        self.domain_x_min = float(domain_x_min)
+        self.domain_x_max = float(domain_x_max)
+        self.domain_y_bottom = float(domain_y_bottom)
+        self.domain_y_top = float(domain_y_top)
+        self.plate_center = None if plate_center is None else float(plate_center)
+        self.plate_width = None if plate_width is None else float(plate_width)
+        self.boundary_mode_scale = float(boundary_mode_scale)
 
         state_layers = [2] + [[int(state_width)] * 5 for _ in range(int(state_depth))] + [5]
         self.state_net = dde.nn.PFNN(state_layers, activation, initializer)
@@ -63,7 +79,26 @@ class BoundaryMaterialPFNN(torch.nn.Module):
     def top_modes_torch(self, inputs):
         if self.num_boundary_modes <= 0:
             return inputs[:, 0:0]
-        xp = inputs[:, 0:1]
+        xp_raw = inputs[:, 0:1]
+        if self.boundary_mode_type == "plate":
+            if self.plate_center is None or self.plate_width is None:
+                raise ValueError("plate boundary modes require plate_center and plate_width.")
+            local = (xp_raw - self.plate_center) / (0.5 * self.plate_width)
+            modes = [torch.ones_like(local) * self.boundary_mode_scale]
+            if self.num_boundary_modes >= 2:
+                modes.append(self.boundary_mode_scale * local)
+            if self.num_boundary_modes >= 3:
+                modes.append(self.boundary_mode_scale * (2.0 * local**2 - 1.0))
+            if self.num_boundary_modes >= 4:
+                modes.append(self.boundary_mode_scale * torch.sin(torch.pi * (local + 1.0) / 2.0))
+            if self.num_boundary_modes >= 5:
+                modes.append(self.boundary_mode_scale * torch.sin(torch.pi * local))
+            if self.num_boundary_modes > 5:
+                raise ValueError(f"Unsupported num_boundary_modes={self.num_boundary_modes}")
+            return torch.cat(modes[: self.num_boundary_modes], dim=1)
+
+        x_span = max(self.domain_x_max - self.domain_x_min, 1.0e-12)
+        xp = (xp_raw - self.domain_x_min) / x_span
         modes = [
             0.15
             + 0.04 * torch.sin(torch.pi * xp)
@@ -88,7 +123,9 @@ class BoundaryMaterialPFNN(torch.nn.Module):
         beta = self.beta.to(dtype=inputs.dtype, device=inputs.device).view(-1, 1)
         top_value = self.top_modes_torch(inputs) @ beta
         ub = torch.zeros_like(top_value)
-        vb = inputs[:, 1:2] * top_value
+        y_span = max(self.domain_y_top - self.domain_y_bottom, 1.0e-12)
+        lift = (inputs[:, 1:2] - self.domain_y_bottom) / y_span
+        vb = lift * top_value
         return ub, vb
 
     def top_boundary_value(self, inputs):

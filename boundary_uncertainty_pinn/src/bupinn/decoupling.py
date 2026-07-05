@@ -124,8 +124,9 @@ class ObservationProjector:
 class ReactionIntegral:
     """Fast top-boundary resultant reaction operator."""
 
-    def __init__(self, weights: np.ndarray):
+    def __init__(self, weights: np.ndarray, boundary_y: float = 1.0):
         self.weights_np = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
+        self.boundary_y = float(boundary_y)
         self._cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
         self._index_cache: dict[tuple[int, int], np.ndarray] = {}
 
@@ -145,7 +146,7 @@ class ReactionIntegral:
             return cached
         n = len(self.weights_np)
         x_np = np.asarray(X, dtype=np.float32)
-        top_rows = np.where(np.isclose(x_np[:, 1], 1.0, atol=1.0e-7))[0]
+        top_rows = np.where(np.isclose(x_np[:, 1], self.boundary_y, atol=1.0e-7))[0]
         if len(top_rows) < n:
             raise RuntimeError(f"Reaction integral expected {n} top-boundary rows, got {len(top_rows)}.")
         # PointSetOperatorBC places its own point set as a contiguous block. If
