@@ -20,13 +20,29 @@ class ObservationProjector:
     where D contains low-dimensional boundary-induced displacement modes.
     """
 
-    def __init__(self, obs_x: np.ndarray, obs_u: np.ndarray, design: np.ndarray, ridge: float):
+    def __init__(
+        self,
+        obs_x: np.ndarray,
+        obs_u: np.ndarray,
+        design: np.ndarray,
+        ridge: float,
+        core_start: int | None = 7,
+        boundary_start: int | None = 9,
+        prediction_start: int = 0,
+        cache_components: int = 1,
+    ):
         self.obs_x = np.asarray(obs_x, dtype=np.float32)
         self.obs_u = np.asarray(obs_u, dtype=np.float32)
         self.design_np = np.asarray(design, dtype=np.float32)
         self.ridge = float(ridge)
+        self.core_start = None if core_start is None else int(core_start)
+        self.boundary_start = None if boundary_start is None else int(boundary_start)
+        self.prediction_start = int(prediction_start)
+        self.cache_components = int(cache_components)
         self._cache: dict[tuple[torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
         self._index_cache: dict[tuple[int, int, int], np.ndarray] = {}
+        self._index_tensor_cache: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
+        self._projection_cache: dict[str, object] = {}
         self.lookup = {
             tuple(np.round(pt, decimals=8).tolist()): i
             for i, pt in enumerate(self.obs_x[:, :2])
@@ -77,6 +93,82 @@ class ObservationProjector:
         self._index_cache[key] = row_for_obs
         return row_for_obs
 
+    def _row_index_tensor(self, X, occurrence: int, device: torch.device) -> torch.Tensor:
+        x_len = len(X)
+        key = (id(X), x_len, int(occurrence), device)
+        cached = self._index_tensor_cache.get(key)
+        if cached is not None:
+            return cached
+        row_index = torch.as_tensor(self._row_index(X, occurrence=occurrence), dtype=torch.long, device=device)
+        self._index_tensor_cache[key] = row_index
+        return row_index
+
+    def _has_split_outputs(self, outputs) -> bool:
+        if self.core_start is None or self.boundary_start is None:
+            return False
+        return outputs.shape[1] >= self.boundary_start + 2
+
+    def _split_prediction(self, point_outputs, update_path: str):
+        if update_path == "joint" or not self._has_split_outputs(point_outputs):
+            start = self.prediction_start
+            return point_outputs[:, start : start + 2]
+        core = point_outputs[:, self.core_start : self.core_start + 2]
+        boundary = point_outputs[:, self.boundary_start : self.boundary_start + 2]
+        if update_path == "material":
+            return core + boundary.detach()
+        if update_path == "boundary":
+            return core.detach() + boundary
+        raise ValueError(f"Unknown update_path: {update_path}")
+
+    def _projection_values(self, outputs, X, source_occurrence: int, update_path: str) -> dict[tuple[str, int], torch.Tensor]:
+        key = (
+            id(outputs),
+            id(X),
+            outputs.shape[0],
+            outputs.shape[1],
+            str(outputs.device),
+            str(outputs.dtype),
+            self.core_start,
+            self.boundary_start,
+            self.prediction_start,
+        )
+        cached = self._projection_cache.get("entry")
+        if isinstance(cached, dict) and cached.get("key") == key:
+            return cached["values"]  # type: ignore[return-value]
+
+        row_index = self._row_index_tensor(X, source_occurrence, outputs.device)
+        point_outputs = outputs[row_index]
+        target, design, gram_inv = self._tensors(outputs.device, outputs.dtype)
+
+        pred_material = self._split_prediction(point_outputs, update_path="material" if update_path != "joint" else "joint")
+        pred_boundary = self._split_prediction(point_outputs, update_path="boundary" if update_path != "joint" else "joint")
+        flat_material = torch.cat(
+            [pred_material[:, 0] - target[:, 0], pred_material[:, 1] - target[:, 1]],
+            dim=0,
+        )
+        flat_boundary_path = torch.cat(
+            [pred_boundary[:, 0] - target[:, 0], pred_boundary[:, 1] - target[:, 1]],
+            dim=0,
+        )
+        if design.numel() == 0 or design.shape[1] == 0:
+            material_boundary_flat = torch.zeros_like(flat_material)
+            boundary_flat = torch.zeros_like(flat_boundary_path)
+        else:
+            coeff_material = gram_inv @ (design.T @ flat_material)
+            coeff_boundary = gram_inv @ (design.T @ flat_boundary_path)
+            material_boundary_flat = design @ coeff_material
+            boundary_flat = design @ coeff_boundary
+        material_projected = flat_material - material_boundary_flat
+        n_obs = len(self.obs_x)
+        values = {
+            ("material", 0): material_projected[:n_obs].reshape(-1, 1),
+            ("material", 1): material_projected[n_obs : 2 * n_obs].reshape(-1, 1),
+            ("boundary", 0): boundary_flat[:n_obs].reshape(-1, 1),
+            ("boundary", 1): boundary_flat[n_obs : 2 * n_obs].reshape(-1, 1),
+        }
+        self._projection_cache["entry"] = {"key": key, "values": values, "uses": 0}
+        return values
+
     def projected_component(
         self,
         inputs,
@@ -87,48 +179,49 @@ class ObservationProjector:
         update_path: str = "joint",
         occurrence: int = 0,
     ):
-        n_obs = len(self.obs_x)
-        row_index_np = self._row_index(X, occurrence=occurrence)
-        row_index = torch.as_tensor(row_index_np, dtype=torch.long, device=outputs.device)
-        point_outputs = outputs[row_index]
-        if update_path == "joint" or outputs.shape[1] < 11:
-            pred = point_outputs[:, 0:2]
-        else:
-            core = point_outputs[:, 7:9]
-            boundary = point_outputs[:, 9:11]
-            if update_path == "material":
-                pred = core + boundary.detach()
-            elif update_path == "boundary":
-                pred = core.detach() + boundary
-            else:
-                raise ValueError(f"Unknown update_path: {update_path}")
-        target, design, gram_inv = self._tensors(outputs.device, outputs.dtype)
-        flat = torch.cat([pred[:, 0] - target[:, 0], pred[:, 1] - target[:, 1]], dim=0)
-        if design.numel() == 0 or design.shape[1] == 0:
-            boundary_flat = torch.zeros_like(flat)
-        else:
-            coeff = gram_inv @ (design.T @ flat)
-            boundary_flat = design @ coeff
-        if part == "boundary":
-            projected = boundary_flat
-        elif part == "material":
-            projected = flat - boundary_flat
-        else:
+        if part not in {"boundary", "material"}:
             raise ValueError(f"Unknown projection part: {part}")
-        values = projected[int(component) * n_obs : (int(component) + 1) * n_obs].reshape(-1, 1)
+        values = self._projection_values(outputs, X, occurrence, update_path)[(part, int(component))]
+        row_index = self._row_index_tensor(X, occurrence, outputs.device)
         result = torch.zeros((outputs.shape[0], 1), dtype=outputs.dtype, device=outputs.device)
         result[row_index, 0:1] = values
+        cached = self._projection_cache.get("entry")
+        if isinstance(cached, dict):
+            cached["uses"] = int(cached.get("uses", 0)) + 1
+            if int(cached["uses"]) >= max(1, self.cache_components):
+                self._projection_cache.clear()
         return result
 
 
 class ReactionIntegral:
-    """Fast top-boundary resultant reaction operator."""
+    """Fast resultant reaction operator with cached point and tensor indices."""
 
-    def __init__(self, weights: np.ndarray, boundary_y: float = 1.0):
+    def __init__(
+        self,
+        weights: np.ndarray,
+        boundary_y: float = 1.0,
+        points: np.ndarray | None = None,
+        stress_index: int = 3,
+        scale: float = 1.0,
+        occurrence: int = 0,
+        fill_all: bool = False,
+    ):
         self.weights_np = np.asarray(weights, dtype=np.float32).reshape(-1, 1)
         self.boundary_y = float(boundary_y)
+        self.points = None if points is None else np.asarray(points, dtype=np.float32)
+        self.stress_index = int(stress_index)
+        self.scale = float(scale)
+        self.occurrence = int(occurrence)
+        self.fill_all = bool(fill_all)
         self._cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
-        self._index_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._index_cache: dict[tuple[int, int, int], np.ndarray] = {}
+        self._index_tensor_cache: dict[tuple[int, int, int, torch.device], torch.Tensor] = {}
+        self.lookup = None
+        if self.points is not None:
+            self.lookup = {
+                tuple(np.round(pt, decimals=8).tolist()): i
+                for i, pt in enumerate(self.points[:, :2])
+            }
 
     def _weights(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         key = (device, dtype)
@@ -140,12 +233,38 @@ class ReactionIntegral:
         return weights
 
     def _row_index(self, X) -> np.ndarray:
-        key = (id(X), len(X))
+        key = (id(X), len(X), self.occurrence)
         cached = self._index_cache.get(key)
         if cached is not None:
             return cached
-        n = len(self.weights_np)
         x_np = np.asarray(X, dtype=np.float32)
+        n = len(self.weights_np)
+        if self.points is not None:
+            matches: list[list[int]] = [[] for _ in range(len(self.points))]
+            rounded = np.round(x_np[:, :2], decimals=8)
+            if self.lookup is None:
+                raise RuntimeError("Reaction point lookup is not initialized.")
+            for row, pt in enumerate(rounded):
+                idx = self.lookup.get(tuple(pt.tolist()), -1)
+                if idx >= 0:
+                    matches[idx].append(row)
+            rows = np.full(len(self.points), -1, dtype=np.int64)
+            for idx, row_list in enumerate(matches):
+                if len(row_list) > self.occurrence:
+                    rows[idx] = row_list[self.occurrence]
+                elif row_list:
+                    rows[idx] = row_list[-1]
+            if np.any(rows < 0):
+                missing = int(np.sum(rows < 0))
+                counts = sorted({len(row_list) for row_list in matches})
+                raise RuntimeError(
+                    "Reaction integral missing "
+                    f"{missing} rows for occurrence={self.occurrence}; "
+                    f"available duplicate counts={counts}."
+                )
+            self._index_cache[key] = rows
+            return rows
+
         top_rows = np.where(np.isclose(x_np[:, 1], self.boundary_y, atol=1.0e-7))[0]
         if len(top_rows) < n:
             raise RuntimeError(f"Reaction integral expected {n} top-boundary rows, got {len(top_rows)}.")
@@ -165,12 +284,22 @@ class ReactionIntegral:
         self._index_cache[key] = best.astype(np.int64)
         return self._index_cache[key]
 
+    def _row_index_tensor(self, X, device: torch.device) -> torch.Tensor:
+        key = (id(X), len(X), self.occurrence, device)
+        cached = self._index_tensor_cache.get(key)
+        if cached is not None:
+            return cached
+        row_index = torch.as_tensor(self._row_index(X), dtype=torch.long, device=device)
+        self._index_tensor_cache[key] = row_index
+        return row_index
+
     def __call__(self, inputs, outputs, X):
         weights = self._weights(outputs.device, outputs.dtype)
-        row_index_np = self._row_index(X)
-        row_index = torch.as_tensor(row_index_np, dtype=torch.long, device=outputs.device)
-        syy = outputs[row_index, 3:4]
-        resultant = torch.sum(syy * weights)
+        row_index = self._row_index_tensor(X, outputs.device)
+        density = outputs[row_index, self.stress_index : self.stress_index + 1]
+        resultant = torch.sum(density * weights) / self.scale
+        if self.fill_all:
+            return torch.ones((outputs.shape[0], 1), dtype=outputs.dtype, device=outputs.device) * resultant
         result = torch.zeros((outputs.shape[0], 1), dtype=outputs.dtype, device=outputs.device)
         result[row_index, 0:1] = resultant
         return result

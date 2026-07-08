@@ -1,31 +1,37 @@
-# PowerShell 调远程集群命令避坑记录
+# PowerShell 调远程集群固定规则
 
-本文档专门记录本项目在 Windows PowerShell 本地终端中通过 `ssh manage` 调远程集群时的固定规则。目的很简单：避免 PowerShell 把本来应该交给远端 Linux shell 的 `|`、`||`、`$变量`、here-doc 或引号提前解析，导致浪费时间。
+本项目本地终端是 Windows PowerShell，远端管理节点和计算节点是 Linux shell。以后所有远程实验启动、检查、同步和临时脚本都按本文执行，避免 PowerShell 把本应交给远端 bash 或 Python 的符号提前解析。
 
-## 1. 根本原因
+## 为什么会被 PowerShell 卡住
 
-本地 shell 是 PowerShell，远端 shell 是 Linux bash。下面这些符号如果直接写在 PowerShell 命令字符串里，很容易先被 PowerShell 解释，而不是传给远端：
+PowerShell 会先解析本地命令行，再把字符串传给 `ssh`。下面这些符号如果直接写进 `ssh manage "..."`，很容易先被本地 PowerShell 处理：
 
 ```text
-|
-||
-$
-<<EOF
+|、||、&&
+$var
+<<EOF / <<'PY'
 单双引号混用
-带 f-string 或花括号的 Python one-liner
+awk、grep、sed、python -c 里带花括号或引号的表达式
 ```
 
-因此，涉及远端循环、管道、grep、awk、Python here-doc、bash here-doc 的命令，不能直接写成长的 `ssh manage "..."`。
+典型后果包括：
 
-## 2. 禁止写法
+```text
+The token '||' is not a valid statement separator
+The '<' operator is reserved for future use
+远端 bash: 语法错误: 未预期的文件结尾
+远端 Python: SyntaxError / EOF while scanning triple-quoted string
+```
 
-不要在 PowerShell 里直接写这种命令：
+## 禁止写法
+
+不要把复杂 bash 逻辑塞进 PowerShell 双引号：
 
 ```powershell
-ssh manage "for n in ...; do ps ... | grep xxx || true; done"
+ssh manage "cd /path && for r in B0 B1; do ps -ef | grep $r || true; done"
 ```
 
-不要写这种 here-doc：
+不要在 PowerShell 里直接写 Linux here-doc：
 
 ```powershell
 ssh manage "python3 - <<'PY'
@@ -33,116 +39,126 @@ print('hello')
 PY"
 ```
 
-不要在双引号远端命令里直接写远端变量：
+不要用本地 `sed -i "s/\r$//"` 处理远端换行。以前这个写法把路径里的 `deepxde-master` 误伤成了 `deepxde-maste`。换行统一用远端 Python 处理。
+
+## 推荐写法一：优先使用远端项目脚本
+
+能固化的启动、检查、汇总逻辑，必须放进远端项目的 `hpc/*.sh`，本地只调用一个简单命令。
 
 ```powershell
-ssh manage "for r in A5 A13; do echo $r; done"
+ssh manage 'cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn && bash hpc/check_fem_multiload_gate_lf.sh 02.FEMThreeLoadFormal 20260708_120000'
 ```
 
-这些写法可能被 PowerShell 提前解析，常见报错包括：
-
-```text
-The token '||' is not a valid statement separator
-The '<' operator is reserved for future use
-Missing expression after ','
-远端 bash: 语法错误: 未预期的文件结尾
-```
-
-## 3. 推荐写法一：优先使用项目脚本
-
-能写成脚本的检查、启动、汇总逻辑，全部放到远端项目的 `hpc/*.sh` 里，然后本地只调用脚本。
-
-推荐：
+新增或修改脚本后必须检查：
 
 ```powershell
-ssh manage 'cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn && bash hpc/check_key_ablation_lf.sh 00.SmokeKeyAblation 20260703_key_smoke3000'
+ssh manage 'cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn && bash -n hpc/run_fem_multiload_gate_onecase_lf.sh hpc/launch_fem_multiload_gate_formal_lf.sh'
 ```
 
-优点：
+## 推荐写法二：简单远程命令用单引号
 
-```text
-1. 本地 PowerShell 只负责传一个简单命令。
-2. 复杂循环、管道、grep、awk 都在远端 bash 脚本里执行。
-3. 脚本可以 bash -n 检查，可以复用，可以记录到版本中。
-```
-
-## 4. 推荐写法二：简单远端命令用单引号
-
-如果必须直接 `ssh manage`，远端命令尽量用 PowerShell 单引号包住，避免本地展开 `$变量`。
-
-推荐：
+如果只是 `ls`、`tail`、`find` 这类简单命令，用 PowerShell 单引号包住远端命令，避免本地展开 `$变量`。
 
 ```powershell
-ssh manage 'cd /path/to/project && for r in A5 A13 A14; do if [ -e "exp/$r" ]; then echo exists:$r; else echo clear:$r; fi; done'
+ssh manage 'cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn && find exp -maxdepth 2 -type d | sort | head'
 ```
 
-不要用 PowerShell 双引号包住包含 `$r` 的远端命令。
+包含远端变量时也用单引号：
 
-## 5. 推荐写法三：复杂临时逻辑用 stdin 脚本
+```powershell
+ssh manage 'for r in B0 B1 B2; do echo "$r"; done'
+```
 
-如果临时检查逻辑太长，不要塞进一行 `ssh manage "..."`。可以把脚本内容通过 stdin 传给远端解释器。
+## 推荐写法三：复杂临时逻辑走 stdin
 
-PowerShell 示例：
+临时 Python 用 PowerShell here-string 通过 stdin 传给远端 Python：
 
 ```powershell
 @'
 from pathlib import Path
 base = Path("/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn")
-for run in ["A5", "A13", "A14", "A15"]:
-    print(run, (base / "exp" / "00.SmokeKeyAblation" / run).exists())
+for rel in ["scripts/train_fem_multiload_gate.py", "src/bupinn/decoupling.py"]:
+    p = base / rel
+    print(rel, p.exists(), p.stat().st_size if p.exists() else None)
 '@ | ssh manage python3 -
 ```
 
-或者：
+临时 bash 也通过 stdin：
 
 ```powershell
 @'
 set -euo pipefail
 cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn
-bash hpc/check_key_ablation_lf.sh 00.SmokeKeyAblation 20260703_key_smoke3000
+python -m py_compile scripts/train_fem_multiload_gate.py src/bupinn/decoupling.py
+bash -n hpc/run_fem_multiload_gate_onecase_lf.sh
 '@ | ssh manage bash -s
 ```
 
-注意：stdin 脚本里如果再次嵌套 ssh 到计算节点，也要尽量把复杂逻辑放进远端已有脚本，避免多层引号。
+如果 stdin 脚本里还要二次 `ssh comput*`，不要再嵌套复杂引号。优先调用远端已有 `hpc/*.sh`。
 
-## 6. 中文文件名检查规则
-
-PowerShell 管道有时会让中文文件名在传入远端 Python 时变成问号。检查中文图名时，不直接把中文文件名嵌在本地命令里，优先使用 Unicode 转义或远端脚本。
-
-推荐：
+不要在本地或管理节点 Python 里用下面这种方式传多行脚本：
 
 ```python
-name = "\u635f\u5931\u5386\u53f2\u56fe.png"  # 损失历史图.png
+subprocess.run(["ssh", "comput1", "bash", "-lc", multi_line_script])
 ```
 
-或者直接在远端项目中写检查脚本。
+这类命令容易让远端 shell 把 `multi_line_script` 的第一段当成 `bash -lc` 的命令字符串，其余行又被外层 shell 继续解释，表现为无故打印整个 `set` 环境或出现半执行状态。需要临时向计算节点发送多行脚本时，使用 `ssh comput1 bash -s` 并通过 stdin 传入，或者直接新增/调用项目 `hpc/*.sh`。
 
-## 7. 长实验状态检查固定流程
+## 远端换行规范
 
-判断实验是否 live，仍然必须同时看三类信息：
-
-```text
-1. 计算节点上是否存在活的 python 训练进程。
-2. train.log 的修改时间是否是当前时间。
-3. 日志中的 step 是否增长。
-```
-
-不能只看 screen，不能用旧日志，不能用历史 `screen.log`。
-
-本项目优先使用：
+同步本地文件到远端后，如需保证 LF，使用远端 Python：
 
 ```powershell
-ssh manage 'cd /public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn && bash hpc/check_key_ablation_lf.sh <GROUP> <STAMP>'
+@'
+from pathlib import Path
+base = Path("/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn")
+for rel in [
+    "hpc/run_fem_multiload_gate_onecase_lf.sh",
+    "hpc/launch_fem_multiload_gate_formal_lf.sh",
+]:
+    p = base / rel
+    text = p.read_text(encoding="utf-8", errors="replace")
+    p.write_text(text.replace("\r\n", "\n").replace("\r", "\n"), encoding="utf-8")
+'@ | ssh manage python3 -
 ```
 
-## 8. 后续执行原则
+不要用 `sed -i` 做 CRLF 修复。
 
-以后涉及远端实验，默认顺序是：
+## 实验状态检查规则
+
+判断长实验是否仍在运行，不能只看 `screen`。必须至少同时检查：
 
 ```text
-1. 能用 hpc 脚本就用 hpc 脚本。
-2. 必须临时检查时，用 PowerShell 单引号包住简单远端命令。
-3. 命令包含管道、循环、Python 多行、here-doc 时，用 stdin 脚本。
-4. 不再在 PowerShell 双引号里硬塞复杂 bash/Python。
-5. 新增的远端脚本必须先做 bash -n；Python 文件必须先 py_compile。
+1. 计算节点上存在活的 Python 训练进程。
+2. train.log 修改时间在增长。
+3. 日志中的 step 或 DeepXDE 迭代数在增长。
+```
+
+不要把旧 `screen.log`、失败快照目录或历史日志当成 live 状态。
+
+## 启动正式实验前的固定顺序
+
+```text
+1. 同步代码到远端项目目录。
+2. 用远端 Python 统一 LF 换行。
+3. 远端执行 py_compile 和 bash -n。
+4. 先跑 smoke，确认代码、环境、产物目录和图表生成正常。
+5. smoke 通过后再启动正式长跑。
+6. 长跑启动后给出预计完成时间，不持续空转监控。
+```
+
+## 当前项目关键默认设置
+
+正式 FEM 多工况主线默认不启用材料平滑项：
+
+```text
+MATERIAL_SMOOTHNESS_WEIGHT=0.0
+```
+
+动态损失图和材料参数演化图仍按 1000 步保存：
+
+```text
+DISPLAY_EVERY=1000
+DYNAMIC_FIGURE_EVERY=1000
+MATERIAL_MONITOR_EVERY=1000
 ```

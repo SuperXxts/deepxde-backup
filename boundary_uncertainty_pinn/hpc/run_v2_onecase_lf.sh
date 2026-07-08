@@ -2,7 +2,7 @@
 set -euo pipefail
 
 PROJECT=/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/boundary_uncertainty_pinn
-DEEPXDE_ROOT=/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/deepxde-maste
+DEEPXDE_ROOT=/public/home/xinxi/wxtian/WXTIAN/PINN/deepxde/deepxde-master
 
 CASE=${CASE:?Set CASE, e.g. learnable_A_reaction}
 RUN_STAMP=${RUN_STAMP:?Set RUN_STAMP, e.g. 20260702_dual_smoke}
