@@ -13,6 +13,16 @@ os.environ.setdefault("DDE_BACKEND", "pytorch")
 
 
 CASE_CHOICES = tuple(f"A{i}" for i in range(16))
+FORMAL_CORE_CASE_MAP = {
+    "A0": "A0",
+    "A1": "A1",
+    "A2": "A2",
+    "A3": "A3",
+    "A4": "A5",
+    "A5": "A9",
+    "A6": "A14",
+    "A7": "A15",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -27,6 +37,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-grid", type=int, default=8)
     parser.add_argument("--val-grid", type=int, default=21)
     parser.add_argument("--test-grid", type=int, default=51)
+    parser.add_argument("--obs-count", type=int, default=None)
+    parser.add_argument("--val-count", type=int, default=None)
+    parser.add_argument("--test-nx", type=int, default=None)
+    parser.add_argument("--test-ny", type=int, default=None)
+    parser.add_argument("--formal-core-map", action="store_true")
     parser.add_argument("--anchor-count", type=int, default=4)
     parser.add_argument("--reaction-points", type=int, default=80)
     parser.add_argument("--width", type=int, default=48)
@@ -105,7 +120,9 @@ def main() -> None:
         plot_sampling,
     )
 
-    settings = case_settings(args.case)
+    requested_case = args.case
+    effective_case = FORMAL_CORE_CASE_MAP.get(args.case, args.case) if args.formal_core_map else args.case
+    settings = case_settings(effective_case)
     dirs = ensure_run_dirs(args.run_dir)
     np.random.seed(args.seed)
     dde.config.set_random_seed(args.seed)
@@ -115,6 +132,9 @@ def main() -> None:
 
     geom = dde.geometry.Rectangle([0.0, 0.0], [1.0, 1.0])
     k0, mu0 = analytical.reference_k_mu(args.nu)
+
+    def normalize_inputs_torch(x):
+        return 2.0 * x - 1.0
 
     def lambda_from_k_mu(k, mu):
         return k - 2.0 * mu / 3.0
@@ -301,7 +321,12 @@ def main() -> None:
         "top_uy",
     ]
 
-    obs_x = analytical.make_grid(args.obs_grid, include_boundary=False)
+    if args.obs_count is None:
+        obs_x = analytical.make_grid(args.obs_grid, include_boundary=False)
+        observation_layout = f"structured_grid_{args.obs_grid}x{args.obs_grid}"
+    else:
+        obs_x = analytical.make_observation_points(args.obs_count, args.seed)
+        observation_layout = f"random_interior_count_{args.obs_count}"
     obs_u = analytical.add_noise(analytical.displacement(obs_x, args.true_A), args.noise_level, args.seed)
 
     if settings["decoupled_obs"]:
@@ -395,7 +420,12 @@ def main() -> None:
         depth = args.wide_depth if settings["wide"] else args.depth
         layer_sizes = [2] + [[int(width)] * 7 for _ in range(int(depth))] + [7]
         net = dde.nn.PFNN(layer_sizes, "tanh", "Glorot normal")
-        network_config = {"type": "DeepXDE PFNN", "layer_sizes": layer_sizes}
+        net.apply_feature_transform(normalize_inputs_torch)
+        network_config = {
+            "type": "DeepXDE PFNN",
+            "layer_sizes": layer_sizes,
+            "input_normalization": "x,y mapped to [-1,1] before the neural network",
+        }
     else:
         init_beta = [args.init_A] + [0.0] * (max(1, int(args.boundary_modes)) - 1)
         net = BoundaryMaterialPFNN(
@@ -409,6 +439,7 @@ def main() -> None:
             trainable_boundary=bool(settings["boundary_layer"]),
             use_boundary_layer=bool(settings["boundary_layer"]),
         )
+        net.apply_feature_transform(normalize_inputs_torch)
         network_config = {
             "type": "BoundaryMaterialPFNN",
             "state_width": args.width,
@@ -417,6 +448,7 @@ def main() -> None:
             "material_depth": args.material_depth,
             "num_boundary_modes": int(args.boundary_modes),
             "use_boundary_layer": bool(settings["boundary_layer"]),
+            "input_normalization": "state/material branches use normalized coordinates; boundary layer uses physical coordinates",
         }
 
     model = dde.Model(data, net)
@@ -615,7 +647,12 @@ def main() -> None:
     param_log = ParameterLogger(dirs["dat"] / "boundary_parameter_history.dat", args.display_every)
 
     names = ["ux", "uy", "sxx", "syy", "sxy", "K", "mu", "E", "nu"]
-    validation_x_for_monitor = analytical.make_grid(args.val_grid, include_boundary=False)
+    if args.val_count is None:
+        validation_x_for_monitor = analytical.make_grid(args.val_grid, include_boundary=False)
+        validation_layout = f"structured_grid_{args.val_grid}x{args.val_grid}"
+    else:
+        validation_x_for_monitor = analytical.make_validation_points(args.val_count, args.seed)
+        validation_layout = f"random_interior_count_{args.val_count}"
     validation_truth_for_monitor = analytical.all_fields_k_mu(validation_x_for_monitor, args.true_A, args.nu)
 
     class DynamicFigureLogger(dde.callbacks.Callback):
@@ -686,6 +723,17 @@ def main() -> None:
     config.update(
         {
             "case_settings": settings,
+            "requested_case": requested_case,
+            "effective_case": effective_case,
+            "formal_core_map_enabled": bool(args.formal_core_map),
+            "formal_core_case_map": FORMAL_CORE_CASE_MAP if args.formal_core_map else {},
+            "observation_layout": observation_layout,
+            "validation_layout": validation_layout,
+            "test_layout": (
+                f"structured_grid_{args.test_nx}x{args.test_ny}"
+                if args.test_nx is not None or args.test_ny is not None
+                else f"structured_grid_{args.test_grid}x{args.test_grid}"
+            ),
             "backend": dde.backend.backend_name,
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "torch_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
@@ -719,7 +767,14 @@ def main() -> None:
     )
     write_json(dirs["json"] / "config.json", config)
     write_json(dirs["json"] / "run_config.json", config)
-    (args.run_dir / "实验说明.txt").write_text(case_description(args.case), encoding="utf-8")
+    description = case_description(effective_case)
+    if args.formal_core_map:
+        description = (
+            f"连续编号: {requested_case}\n"
+            f"对应旧核心消融工况: {effective_case}\n\n"
+            f"{description}"
+        )
+    (args.run_dir / "实验说明.txt").write_text(description, encoding="utf-8")
     (args.run_dir / "消融实验矩阵.md").write_text(case_markdown_table(), encoding="utf-8")
     if str(args.run_note).strip():
         (args.run_dir / "变体说明.txt").write_text(str(args.run_note).strip() + "\n", encoding="utf-8")
@@ -772,11 +827,18 @@ def main() -> None:
     )
 
     names = ["ux", "uy", "sxx", "syy", "sxy", "K", "mu", "E", "nu"]
+    if args.test_nx is None and args.test_ny is None:
+        evaluation_x = analytical.make_grid(args.test_grid, include_boundary=True)
+    else:
+        test_nx = int(args.test_nx if args.test_nx is not None else args.test_grid)
+        test_ny = int(args.test_ny if args.test_ny is not None else args.test_grid)
+        evaluation_x = analytical.structured_grid_points(test_nx, test_ny, include_boundary=True)
     split_defs = {
-        "evaluation": analytical.make_grid(args.test_grid, include_boundary=True),
+        "evaluation": evaluation_x,
         "validation": analytical.make_grid(args.val_grid, include_boundary=False),
         "train": obs_x,
     }
+    split_defs["validation"] = validation_x_for_monitor
     split_metrics: dict[str, dict[str, float]] = {}
     eval_payload = {}
     for split_name, x_split in split_defs.items():
@@ -806,7 +868,7 @@ def main() -> None:
                 "columns": ["x", "y"] + [f"true_{n}" for n in names] + [f"pred_{n}" for n in names] + [f"err_{n}" for n in names],
             },
         )
-        if split_name != "train":
+        if split_name == "evaluation":
             for i, name in enumerate(names):
                 np.savez(
                     dirs["npz"] / f"{split_name}_predictions_{name}.npz",
@@ -815,10 +877,7 @@ def main() -> None:
                     y_pred=pred[:, i],
                     error=pred[:, i] - truth[:, i],
                 )
-                if split_name == "evaluation":
-                    plot_field_triplet(x_split, truth[:, i], pred[:, i], name, dirs["png"] / f"评估_{name}_真值预测误差图.png")
-                else:
-                    plot_field_triplet(x_split, truth[:, i], pred[:, i], name, dirs["png"] / f"验证_{name}_真值预测误差图.png")
+                plot_field_triplet(x_split, truth[:, i], pred[:, i], name, dirs["png"] / f"评估_{name}_真值预测误差图.png")
         eval_payload[split_name] = {"x": x_split, "truth": truth, "pred": pred, "raw": raw}
 
     x_test = split_defs["evaluation"]
@@ -891,7 +950,8 @@ def main() -> None:
 
     final_beta = param_log.rows[-1][1:] if param_log.rows else []
     metrics = {
-        "case": args.case,
+        "case": requested_case,
+        "effective_case": effective_case,
         "iterations": args.iterations,
         "elapsed_seconds": elapsed,
         "final_beta": [float(v) for v in final_beta],

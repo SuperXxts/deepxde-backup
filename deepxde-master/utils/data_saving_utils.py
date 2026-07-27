@@ -7,6 +7,58 @@ import numpy as np
 import json
 
 
+PNG_NAME_REPLACEMENTS = [
+    ("top_nonuniform_compression", "顶部非均匀压缩"),
+    ("cross_layer_shear", "跨层剪切"),
+    ("normal_to_layer", "垂向穿层"),
+    ("edge_patch_load", "边界局部载荷"),
+    ("pure_shear", "纯剪切"),
+    ("biaxial_bulk", "双轴体积"),
+    ("uniaxial_x", "x向单轴"),
+    ("uniaxial_y", "y向单轴"),
+    ("bending_y", "y向弯曲"),
+    ("material_parameter_evolution", "材料参数演化图"),
+    ("sampling_and_case", "采样与案例图"),
+    ("validation_history", "验证历史图"),
+    ("interface_diagnostics", "界面诊断图"),
+    ("observation_fit", "观测拟合图"),
+    ("loss_components", "损失分量图"),
+    ("loss_history", "损失历史图"),
+    ("material_map", "材料分布图"),
+    ("comparison", "对比图"),
+    ("evaluation_last", "评估末次"),
+    ("validation_last", "验证末次"),
+    ("train_last", "训练末次"),
+    ("evaluation", "评估"),
+    ("validation", "验证"),
+    ("train", "训练"),
+    ("boundary", "边界"),
+    ("bulk", "体积模量K"),
+    ("lambda", "拉梅参数λ"),
+    ("mu", "剪切模量μ"),
+    ("sxx", "应力sxx"),
+    ("syy", "应力syy"),
+    ("sxy", "应力sxy"),
+    ("ux", "位移ux"),
+    ("uy", "位移uy"),
+]
+
+
+def _localize_png_filename(filename):
+    if not str(filename).lower().endswith(".png"):
+        return filename
+    stem, ext = os.path.splitext(str(filename))
+    localized = stem
+    for source, target in sorted(PNG_NAME_REPLACEMENTS, key=lambda item: len(item[0]), reverse=True):
+        localized = localized.replace(source, target)
+    localized = localized.replace("_l0_", "_工况0_")
+    localized = localized.replace("_l1_", "_工况1_")
+    localized = localized.replace("_l2_", "_工况2_")
+    localized = localized.replace("_l3_", "_工况3_")
+    localized = localized.replace("_", "_")
+    return f"{localized}{ext}"
+
+
 def _get_save_path(save_dir, subfolder, filename):
     """
     获取保存路径，自动创建子文件夹
@@ -22,6 +74,8 @@ def _get_save_path(save_dir, subfolder, filename):
     os.makedirs(save_dir, exist_ok=True)
     subfolder_path = os.path.join(save_dir, subfolder)
     os.makedirs(subfolder_path, exist_ok=True)
+    if str(subfolder).lower() == "png":
+        filename = _localize_png_filename(filename)
     return os.path.join(subfolder_path, filename)
 
 

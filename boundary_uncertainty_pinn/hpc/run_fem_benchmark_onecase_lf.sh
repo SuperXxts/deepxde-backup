@@ -38,6 +38,11 @@ OBS_MATERIAL_WEIGHT=${OBS_MATERIAL_WEIGHT:-20.0}
 OBS_BOUNDARY_WEIGHT=${OBS_BOUNDARY_WEIGHT:-20.0}
 ANCHOR_WEIGHT=${ANCHOR_WEIGHT:-1.0}
 REACTION_WEIGHT=${REACTION_WEIGHT:-5.0}
+MATERIAL_SMOOTHNESS_WEIGHT=${MATERIAL_SMOOTHNESS_WEIGHT:-1.0e-3}
+K_MIN_FACTOR=${K_MIN_FACTOR:-0.35}
+K_MAX_FACTOR=${K_MAX_FACTOR:-1.80}
+MU_MIN_FACTOR=${MU_MIN_FACTOR:-0.40}
+MU_MAX_FACTOR=${MU_MAX_FACTOR:-1.70}
 GRADIENT_DIAGNOSTIC_PERIOD=${GRADIENT_DIAGNOSTIC_PERIOD:-0}
 EVAL_CHECKPOINT=${EVAL_CHECKPOINT:-best}
 RUN_NOTE=${RUN_NOTE:-}
@@ -118,6 +123,11 @@ mkdir -p "$RUN_DIR/txt"
   echo "obs_boundary_weight=$OBS_BOUNDARY_WEIGHT"
   echo "anchor_weight=$ANCHOR_WEIGHT"
   echo "reaction_weight=$REACTION_WEIGHT"
+  echo "material_smoothness_weight=$MATERIAL_SMOOTHNESS_WEIGHT"
+  echo "k_min_factor=$K_MIN_FACTOR"
+  echo "k_max_factor=$K_MAX_FACTOR"
+  echo "mu_min_factor=$MU_MIN_FACTOR"
+  echo "mu_max_factor=$MU_MAX_FACTOR"
   echo "gradient_diagnostic_period=$GRADIENT_DIAGNOSTIC_PERIOD"
   echo "eval_checkpoint=$EVAL_CHECKPOINT"
   echo "fem_data_dir=$FEM_DATA_DIR"
@@ -172,6 +182,11 @@ python scripts/train_fem_benchmark.py \
   --obs-boundary-weight "$OBS_BOUNDARY_WEIGHT" \
   --anchor-weight "$ANCHOR_WEIGHT" \
   --reaction-weight "$REACTION_WEIGHT" \
+  --material-smoothness-weight "$MATERIAL_SMOOTHNESS_WEIGHT" \
+  --k-min-factor "$K_MIN_FACTOR" \
+  --k-max-factor "$K_MAX_FACTOR" \
+  --mu-min-factor "$MU_MIN_FACTOR" \
+  --mu-max-factor "$MU_MAX_FACTOR" \
   --gradient-diagnostic-period "$GRADIENT_DIAGNOSTIC_PERIOD" \
   --eval-checkpoint "$EVAL_CHECKPOINT" \
   --run-note "$RUN_NOTE" \

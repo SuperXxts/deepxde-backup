@@ -150,7 +150,7 @@ class BoundaryMaterialPFNN(torch.nn.Module):
         material = self.material_net(x)
         ux_core = state[:, 0:1]
         uy_core = state[:, 1:2]
-        ux_b, uy_b = self.boundary_displacement(x)
+        ux_b, uy_b = self.boundary_displacement(inputs)
         outputs = torch.cat(
             [
                 ux_core + ux_b,
@@ -165,6 +165,150 @@ class BoundaryMaterialPFNN(torch.nn.Module):
             ],
             dim=1,
         )
+        if self._output_transform is not None:
+            outputs = self._output_transform(inputs, outputs)
+        return outputs
+
+
+class MultiLoadBoundaryMaterialNet(torch.nn.Module):
+    """Multi-load state networks with one shared material branch.
+
+    Output columns are:
+    [case0 ux, uy, sxx, syy, sxy, case1 ..., zK, zmu]
+    and, when include_diagnostics=True:
+    [case0 ux_core, uy_core, ux_boundary, uy_boundary, case1 ...].
+    """
+
+    def __init__(
+        self,
+        dde,
+        num_cases: int,
+        state_width: int = 56,
+        state_depth: int = 4,
+        material_width: int = 56,
+        material_depth: int = 4,
+        activation: str = "tanh",
+        initializer: str = "Glorot normal",
+        num_boundary_modes: int = 1,
+        init_beta: list[list[float]] | None = None,
+        trainable_boundary: bool = True,
+        use_boundary_layer: bool = True,
+        domain_x_min: float = 0.0,
+        domain_x_max: float = 6.0,
+        domain_y_bottom: float = 0.0,
+        domain_y_top: float = 3.0,
+        plate_centers: list[float] | None = None,
+        plate_widths: list[float] | None = None,
+        include_diagnostics: bool = True,
+    ):
+        super().__init__()
+        self._input_transform = None
+        self._output_transform = None
+        self.regularizer = None
+        self.num_cases = int(num_cases)
+        self.num_boundary_modes = int(num_boundary_modes)
+        self.use_boundary_layer = bool(use_boundary_layer and self.num_boundary_modes > 0)
+        self.domain_x_min = float(domain_x_min)
+        self.domain_x_max = float(domain_x_max)
+        self.domain_y_bottom = float(domain_y_bottom)
+        self.domain_y_top = float(domain_y_top)
+        self.plate_centers = [0.5 * (self.domain_x_min + self.domain_x_max)] * self.num_cases
+        self.plate_widths = [1.0] * self.num_cases
+        self.include_diagnostics = bool(include_diagnostics)
+        if plate_centers is not None:
+            self.plate_centers = [float(v) for v in plate_centers]
+        if plate_widths is not None:
+            self.plate_widths = [float(v) for v in plate_widths]
+        if len(self.plate_centers) != self.num_cases or len(self.plate_widths) != self.num_cases:
+            raise ValueError("plate_centers and plate_widths must match num_cases.")
+
+        self.state_nets = torch.nn.ModuleList(
+            [
+                dde.nn.PFNN([2] + [[int(state_width)] * 5 for _ in range(int(state_depth))] + [5], activation, initializer)
+                for _ in range(self.num_cases)
+            ]
+        )
+        self.material_net = dde.nn.FNN([2] + [int(material_width)] * int(material_depth) + [2], activation, initializer)
+
+        if self.num_boundary_modes > 0:
+            if init_beta is None:
+                init_beta = [[0.0, -0.0425] + [0.0] * (2 * self.num_boundary_modes - 2) for _ in range(self.num_cases)]
+            beta = torch.as_tensor(init_beta, dtype=torch.float32)
+            if beta.shape != (self.num_cases, 2 * self.num_boundary_modes):
+                raise ValueError(
+                    "init_beta must have shape "
+                    f"({self.num_cases}, {2 * self.num_boundary_modes}), got {tuple(beta.shape)}"
+                )
+            self.beta = torch.nn.Parameter(beta, requires_grad=bool(trainable_boundary))
+        else:
+            self.register_buffer("beta", torch.empty((self.num_cases, 0), dtype=torch.float32))
+
+    def apply_feature_transform(self, transform):
+        self._input_transform = transform
+
+    def apply_output_transform(self, transform):
+        self._output_transform = transform
+
+    def num_trainable_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def plate_modes_torch(self, inputs, case_index: int):
+        if self.num_boundary_modes <= 0:
+            return inputs[:, 0:0]
+        center = self.plate_centers[int(case_index)]
+        width = max(self.plate_widths[int(case_index)], 1.0e-12)
+        local = (inputs[:, 0:1] - center) / (0.5 * width)
+        modes = [torch.ones_like(local)]
+        if self.num_boundary_modes >= 2:
+            modes.append(local)
+        if self.num_boundary_modes >= 3:
+            modes.append(2.0 * local**2 - 1.0)
+        if self.num_boundary_modes >= 4:
+            modes.append(torch.sin(torch.pi * (local + 1.0) / 2.0))
+        if self.num_boundary_modes >= 5:
+            modes.append(torch.sin(torch.pi * local))
+        if self.num_boundary_modes > 5:
+            raise ValueError(f"Unsupported num_boundary_modes={self.num_boundary_modes}")
+        return torch.cat(modes[: self.num_boundary_modes], dim=1)
+
+    def boundary_displacement(self, inputs, case_index: int):
+        if not self.use_boundary_layer:
+            zeros = torch.zeros((inputs.shape[0], 1), dtype=inputs.dtype, device=inputs.device)
+            return zeros, zeros
+        beta = self.beta[int(case_index)].to(dtype=inputs.dtype, device=inputs.device)
+        ux_beta = beta[: self.num_boundary_modes].view(-1, 1)
+        uy_beta = beta[self.num_boundary_modes :].view(-1, 1)
+        modes = self.plate_modes_torch(inputs, int(case_index))
+        y_span = max(self.domain_y_top - self.domain_y_bottom, 1.0e-12)
+        lift = (inputs[:, 1:2] - self.domain_y_bottom) / y_span
+        ux_b = lift * (modes @ ux_beta)
+        uy_b = lift * (modes @ uy_beta)
+        return ux_b, uy_b
+
+    def top_boundary_value(self, inputs, case_index: int, component: int):
+        if self.num_boundary_modes <= 0:
+            return torch.zeros((inputs.shape[0], 1), dtype=inputs.dtype, device=inputs.device)
+        beta = self.beta[int(case_index)].to(dtype=inputs.dtype, device=inputs.device)
+        start = 0 if int(component) == 0 else self.num_boundary_modes
+        coeff = beta[start : start + self.num_boundary_modes].view(-1, 1)
+        return self.plate_modes_torch(inputs, int(case_index)) @ coeff
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(inputs)
+        states = []
+        diagnostics = []
+        for case_index, state_net in enumerate(self.state_nets):
+            state = state_net(x)
+            ux_b, uy_b = self.boundary_displacement(inputs, case_index)
+            ux_core = state[:, 0:1]
+            uy_core = state[:, 1:2]
+            states.append(torch.cat([ux_core + ux_b, uy_core + uy_b, state[:, 2:5]], dim=1))
+            if self.include_diagnostics:
+                diagnostics.append(torch.cat([ux_core, uy_core, ux_b, uy_b], dim=1))
+        material = self.material_net(x)
+        outputs = torch.cat(states + [material] + diagnostics, dim=1)
         if self._output_transform is not None:
             outputs = self._output_transform(inputs, outputs)
         return outputs

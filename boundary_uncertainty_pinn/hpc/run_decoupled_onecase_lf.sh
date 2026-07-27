@@ -16,6 +16,10 @@ NUM_BOUNDARY=${NUM_BOUNDARY:-160}
 OBS_GRID=${OBS_GRID:-8}
 VAL_GRID=${VAL_GRID:-21}
 TEST_GRID=${TEST_GRID:-51}
+OBS_COUNT=${OBS_COUNT:-}
+VAL_COUNT=${VAL_COUNT:-}
+TEST_NX=${TEST_NX:-}
+TEST_NY=${TEST_NY:-}
 ANCHOR_COUNT=${ANCHOR_COUNT:-4}
 REACTION_POINTS=${REACTION_POINTS:-80}
 WIDTH=${WIDTH:-48}
@@ -42,6 +46,7 @@ EQUILIBRIUM_FORM=${EQUILIBRIUM_FORM:-mixed}
 REACTION_FORM=${REACTION_FORM:-stress}
 EVAL_CHECKPOINT=${EVAL_CHECKPOINT:-best}
 RUN_NOTE=${RUN_NOTE:-}
+FORMAL_CORE_MAP=${FORMAL_CORE_MAP:-0}
 
 export PATH=/opt/dtk-24.04.3/bin:/opt/dtk-24.04/bin:/usr/local/hyhal/bin:$PATH
 export LD_LIBRARY_PATH=/opt/dtk-24.04.3/lib64:/opt/dtk-24.04.3/lib:/opt/dtk-24.04.3/hip/lib:/opt/dtk-24.04.3/llvm/lib:/opt/dtk-24.04/lib64:/opt/dtk-24.04/lib:/opt/dtk-24.04/hip/lib:/opt/dtk-24.04/llvm/lib:${LD_LIBRARY_PATH:-}
@@ -90,6 +95,10 @@ mkdir -p "$RUN_DIR/txt"
   echo "obs_grid=$OBS_GRID"
   echo "val_grid=$VAL_GRID"
   echo "test_grid=$TEST_GRID"
+  echo "obs_count=${OBS_COUNT:-<grid>}"
+  echo "val_count=${VAL_COUNT:-<grid>}"
+  echo "test_nx=${TEST_NX:-<grid>}"
+  echo "test_ny=${TEST_NY:-<grid>}"
   echo "anchor_count=$ANCHOR_COUNT"
   echo "reaction_points=$REACTION_POINTS"
   echo "width=$WIDTH"
@@ -113,6 +122,7 @@ mkdir -p "$RUN_DIR/txt"
   echo "equilibrium_form=$EQUILIBRIUM_FORM"
   echo "reaction_form=$REACTION_FORM"
   echo "eval_checkpoint=$EVAL_CHECKPOINT"
+  echo "formal_core_map=$FORMAL_CORE_MAP"
   echo "run_note=$RUN_NOTE"
   echo "cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-}"
   date "+start_time=%F %T"
@@ -124,6 +134,21 @@ if [ -n "$MOMENTUM_WEIGHT" ]; then
 fi
 if [ -n "$CONSTITUTIVE_WEIGHT" ]; then
   EXTRA_ARGS+=(--constitutive-weight "$CONSTITUTIVE_WEIGHT")
+fi
+if [ -n "$OBS_COUNT" ]; then
+  EXTRA_ARGS+=(--obs-count "$OBS_COUNT")
+fi
+if [ -n "$VAL_COUNT" ]; then
+  EXTRA_ARGS+=(--val-count "$VAL_COUNT")
+fi
+if [ -n "$TEST_NX" ]; then
+  EXTRA_ARGS+=(--test-nx "$TEST_NX")
+fi
+if [ -n "$TEST_NY" ]; then
+  EXTRA_ARGS+=(--test-ny "$TEST_NY")
+fi
+if [ "$FORMAL_CORE_MAP" = "1" ]; then
+  EXTRA_ARGS+=(--formal-core-map)
 fi
 
 python scripts/train_decoupled_pfnn.py \

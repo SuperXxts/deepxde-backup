@@ -821,7 +821,12 @@ class Model:
                 break
 
     def _train_pytorch_lbfgs(self, verbose=1):
-        prev_n_iter = 0
+        state = self.opt.state_dict().get("state", {})
+        if state:
+            first_state = next(iter(state.values()))
+            prev_n_iter = int(first_state.get("n_iter", 0))
+        else:
+            prev_n_iter = 0
         while prev_n_iter < optimizers.LBFGS_options["maxiter"]:
             self.callbacks.on_epoch_begin()
             self.callbacks.on_batch_begin()
@@ -836,12 +841,16 @@ class Model:
             )
 
             n_iter = self.opt.state_dict()["state"][0]["n_iter"]
-            if prev_n_iter == n_iter - 1:
-                # Converged
+            delta_iter = n_iter - prev_n_iter
+            if delta_iter <= 0:
+                break
+            remaining_iter = max(0, optimizers.LBFGS_options["maxiter"] - prev_n_iter)
+            effective_delta_iter = min(delta_iter, remaining_iter)
+            if effective_delta_iter <= 0:
                 break
 
-            self.train_state.iteration += n_iter - prev_n_iter
-            self.train_state.step += n_iter - prev_n_iter
+            self.train_state.iteration += effective_delta_iter
+            self.train_state.step += effective_delta_iter
             prev_n_iter = n_iter
             self._test(verbose=verbose)
 
@@ -852,7 +861,8 @@ class Model:
                 break
 
     def _train_paddle_lbfgs(self, verbose=1):
-        prev_n_iter = 0
+        state = self.opt.state_dict().get("state", {})
+        prev_n_iter = int(state.get("n_iter", 0)) if state else 0
 
         while prev_n_iter < optimizers.LBFGS_options["maxiter"]:
             self.callbacks.on_epoch_begin()
@@ -868,12 +878,16 @@ class Model:
             )
 
             n_iter = self.opt.state_dict()["state"]["n_iter"]
-            if prev_n_iter == n_iter - 1:
-                # Converged
+            delta_iter = n_iter - prev_n_iter
+            if delta_iter <= 0:
+                break
+            remaining_iter = max(0, optimizers.LBFGS_options["maxiter"] - prev_n_iter)
+            effective_delta_iter = min(delta_iter, remaining_iter)
+            if effective_delta_iter <= 0:
                 break
 
-            self.train_state.iteration += n_iter - prev_n_iter
-            self.train_state.step += n_iter - prev_n_iter
+            self.train_state.iteration += effective_delta_iter
+            self.train_state.step += effective_delta_iter
             prev_n_iter = n_iter
             self._test(verbose=verbose)
 

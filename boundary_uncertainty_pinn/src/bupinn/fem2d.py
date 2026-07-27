@@ -18,16 +18,19 @@ class FEMConfig:
     width: float = 6.0
     depth: float = 3.0
     plate_width: float = 1.0
+    plate_center_fraction: float = 0.5
     nx: int = 96
     ny: int = 48
     settlement: float = -0.05
+    horizontal_displacement: float = 0.035
+    load_type: str = "vertical"
     seed: int = 42
     k_ref: float = 1.0
     mu_ref: float = 0.45
 
     @property
     def plate_center(self) -> float:
-        return 0.5 * self.width
+        return float(self.plate_center_fraction) * self.width
 
     @property
     def plate_left(self) -> float:
@@ -36,6 +39,18 @@ class FEMConfig:
     @property
     def plate_right(self) -> float:
         return self.plate_center + 0.5 * self.plate_width
+
+    @property
+    def plate_displacement(self) -> tuple[float, float]:
+        if self.load_type == "vertical":
+            return 0.0, float(self.settlement)
+        if self.load_type == "horizontal":
+            return float(self.horizontal_displacement), 0.0
+        raise ValueError(f"Unsupported FEM load_type={self.load_type!r}")
+
+    @property
+    def reaction_component(self) -> int:
+        return 0 if self.load_type == "horizontal" else 1
 
 
 @dataclass
@@ -49,6 +64,7 @@ class FEMResult:
     displacements: np.ndarray
     reactions: np.ndarray
     plate_nodes: np.ndarray
+    total_reaction_x: float
     total_reaction_y: float
 
 
@@ -206,9 +222,10 @@ def solve_fem(config: FEMConfig) -> FEMResult:
         prescribed[2 * int(node) + 1] = 0.0
     for node in np.union1d(left, right):
         prescribed[2 * int(node)] = 0.0
+    plate_ux, plate_uy = config.plate_displacement
     for node in plate:
-        prescribed[2 * int(node)] = 0.0
-        prescribed[2 * int(node) + 1] = float(config.settlement)
+        prescribed[2 * int(node)] = float(plate_ux)
+        prescribed[2 * int(node) + 1] = float(plate_uy)
 
     fixed_dofs = np.asarray(sorted(prescribed), dtype=np.int64)
     fixed_vals = np.asarray([prescribed[int(d)] for d in fixed_dofs], dtype=np.float64)
@@ -221,6 +238,7 @@ def solve_fem(config: FEMConfig) -> FEMResult:
     u[free] = spsolve(k_global[free][:, free], rhs)
 
     reactions = k_global @ u - force
+    total_rx = float(np.sum(reactions[2 * plate]))
     total_ry = float(np.sum(reactions[2 * plate + 1]))
 
     element_fields = np.column_stack([k_elem, mu_elem, e_elem, nu_elem])
@@ -237,6 +255,7 @@ def solve_fem(config: FEMConfig) -> FEMResult:
         displacements=displacements.astype(np.float32),
         reactions=reactions.reshape(-1, 2).astype(np.float32),
         plate_nodes=plate.astype(np.int64),
+        total_reaction_x=total_rx,
         total_reaction_y=total_ry,
     )
 
@@ -328,6 +347,7 @@ def save_fem_result(result: FEMResult, out_dir: Path) -> None:
         displacements=result.displacements,
         reactions=result.reactions,
         plate_nodes=result.plate_nodes,
+        total_reaction_x=np.asarray(result.total_reaction_x, dtype=np.float64),
         total_reaction_y=np.asarray(result.total_reaction_y, dtype=np.float64),
         field_names=np.asarray(FIELD_NAMES),
     )
@@ -338,6 +358,7 @@ def save_fem_result(result: FEMResult, out_dir: Path) -> None:
             "num_nodes": int(result.nodes.shape[0]),
             "num_elements": int(result.elements.shape[0]),
             "num_plate_nodes": int(result.plate_nodes.shape[0]),
+            "total_reaction_x": float(result.total_reaction_x),
             "total_reaction_y": float(result.total_reaction_y),
             "ux_min": float(np.min(result.displacements[:, 0])),
             "ux_max": float(np.max(result.displacements[:, 0])),
@@ -362,6 +383,11 @@ def load_fem_result(path: Path) -> FEMResult:
         cfg = FEMConfig(**json.loads(config_path.read_text(encoding="utf-8")))
     else:
         cfg = FEMConfig()
+    total_reaction_x = (
+        float(np.asarray(data["total_reaction_x"]).item())
+        if "total_reaction_x" in data.files
+        else float(np.sum(data["reactions"][data["plate_nodes"], 0]))
+    )
     return FEMResult(
         config=cfg,
         nodes=data["nodes"],
@@ -372,6 +398,7 @@ def load_fem_result(path: Path) -> FEMResult:
         displacements=data["displacements"],
         reactions=data["reactions"],
         plate_nodes=data["plate_nodes"],
+        total_reaction_x=total_reaction_x,
         total_reaction_y=float(np.asarray(data["total_reaction_y"]).item()),
     )
 

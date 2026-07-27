@@ -1,17 +1,92 @@
-"""
-实时保存loss可视化的Callback
-用于在训练过程中定期更新和保存loss历史图像
-"""
+import json
 import os
+from types import SimpleNamespace
+
 import deepxde as dde
-from .save_results import plot_and_save_loss_history, plot_all_loss_components, plot_parameter_history, save_loss_history_json, save_best_test_loss_json
+
+from .save_results import (
+    plot_all_loss_components,
+    plot_and_save_loss_history,
+    plot_parameter_history,
+    save_best_test_loss_json,
+    save_loss_history_json,
+)
+
+
+def _load_history_json(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "steps": [int(step) for step in payload.get("steps", [])],
+        "loss_train": payload.get("loss_train", []) or [],
+        "loss_test": payload.get("loss_test", []) or [],
+    }
+
+
+def _merge_history_payloads(existing, current):
+    merged_steps = []
+    merged_train = []
+    merged_test = []
+
+    def add_row(step, train_row, test_row):
+        step = int(step)
+        train_row = list(train_row) if train_row is not None else []
+        test_row = list(test_row) if test_row is not None else []
+        while merged_steps and merged_steps[-1] > step:
+            merged_steps.pop()
+            merged_train.pop()
+            merged_test.pop()
+        if merged_steps and merged_steps[-1] == step:
+            merged_train[-1] = train_row
+            merged_test[-1] = test_row
+            return
+        merged_steps.append(step)
+        merged_train.append(train_row)
+        merged_test.append(test_row)
+
+    existing_steps = existing.get("steps", []) if existing else []
+    existing_train = existing.get("loss_train", []) if existing else []
+    existing_test = existing.get("loss_test", []) if existing else []
+    for index, step in enumerate(existing_steps):
+        add_row(
+            step,
+            existing_train[index] if index < len(existing_train) else [],
+            existing_test[index] if index < len(existing_test) else [],
+        )
+
+    current_steps = list(getattr(current, "steps", []) or [])
+    current_train = list(getattr(current, "loss_train", []) or [])
+    current_test = list(getattr(current, "loss_test", []) or [])
+    for index, step in enumerate(current_steps):
+        add_row(
+            step,
+            current_train[index] if index < len(current_train) else [],
+            current_test[index] if index < len(current_test) else [],
+        )
+
+    return {
+        "steps": merged_steps,
+        "loss_train": merged_train,
+        "loss_test": merged_test,
+    }
+
+
+def _history_payload_to_namespace(payload):
+    return SimpleNamespace(
+        steps=payload.get("steps", []),
+        loss_train=payload.get("loss_train", []),
+        loss_test=payload.get("loss_test", []),
+    )
 
 
 class ParameterPlottingCallback(dde.callbacks.Callback):
-    """
-    在训练过程中实时绘制参数变化曲线的Callback
-    该Callback会定期读取 VariableValue 生成的文件，并绘制参数变化曲线
-    """
     def __init__(self, param_file, save_path, true_values=None, param_names=None, period=1000):
         super().__init__()
         self.param_file = param_file
@@ -30,36 +105,34 @@ class ParameterPlottingCallback(dde.callbacks.Callback):
                         self.param_file,
                         self.true_values,
                         self.param_names,
-                        self.save_path
+                        self.save_path,
                     )
                 except Exception:
-                    pass  # 忽略绘图过程中的错误（如文件正在写入等）
+                    pass
             self.last_saved_step = current_step
 
 
 class LossHistoryCallback(dde.callbacks.Callback):
-    """
-    在训练过程中实时保存loss可视化图像的Callback
-    
-    这个callback会在每次测试步骤（通常是display_every的倍数）时
-    自动更新并保存loss历史图像，实现实时可视化。
-    
-    参数:
-        save_dir: 保存目录
-        period: 每隔多少个step保存一次（默认与display_every一致，会自动从训练参数中获取）
-        filename: 保存的文件名（默认"损失历史详细图.png"）
-        num_pde_losses: PDE损失的数量（用于分离PDE Loss和BC Loss）
-        num_bc_losses: BC损失的数量（用于分离PDE Loss和BC Loss）
-    """
-    
-    def __init__(self, save_dir, period=None, filename="损失历史详细图.png", 
-                 num_pde_losses=None, num_bc_losses=None,
-                 pde_loss_names=None, bc_loss_names=None,
-                 pde_label="PDE Loss", bc_label="BC Loss",
-                 save_all_components=True):
+    def __init__(
+        self,
+        save_dir,
+        period=None,
+        filename="损失历史详细图.png",
+        num_pde_losses=None,
+        num_bc_losses=None,
+        pde_loss_names=None,
+        bc_loss_names=None,
+        pde_label="Physics Loss",
+        bc_label="Boundary Loss",
+        data_loss_prefix="obs_",
+        data_label="Observation Loss",
+        show_total=False,
+        save_all_components=True,
+        append_existing=False,
+    ):
         super().__init__()
         self.save_dir = save_dir
-        self.period = period  # 如果为None，会在on_train_begin中从display_every获取
+        self.period = period
         self.filename = filename
         self.num_pde_losses = num_pde_losses
         self.num_bc_losses = num_bc_losses
@@ -67,39 +140,43 @@ class LossHistoryCallback(dde.callbacks.Callback):
         self.bc_loss_names = bc_loss_names
         self.pde_label = pde_label
         self.bc_label = bc_label
-        self.save_all_components = save_all_components  # 是否保存所有损失项的详细图
+        self.data_loss_prefix = data_loss_prefix
+        self.data_label = data_label
+        self.show_total = bool(show_total)
+        self.save_all_components = save_all_components
+        self.append_existing = bool(append_existing)
         self.last_saved_step = -1
-        
+        self._existing_history = None
+
     def on_train_begin(self):
-        """训练开始时初始化"""
         os.makedirs(self.save_dir, exist_ok=True)
-        # 如果period未指定，尝试从训练参数中获取display_every
-        # 注意：DeepXDE的callback系统不直接提供display_every，所以需要手动设置
-        # 如果period为None，默认使用1000（DeepXDE的默认display_every）
+        if self.append_existing:
+            history_path = os.path.join(self.save_dir, "json", "loss_history.json")
+            self._existing_history = _load_history_json(history_path)
         if self.period is None:
-            self.period = 1000  # DeepXDE的默认display_every
-        # 保存初始状态（step=0）
+            self.period = 1000
         self._save_loss_history()
-    
+
     def on_batch_end(self):
-        """每个batch结束时检查是否需要保存"""
-        # 在_test()之后，loss history已经更新
-        # 只在测试步骤（display_every的倍数）时保存
         current_step = self.model.train_state.step
         if current_step % self.period == 0 and current_step != self.last_saved_step:
             self._save_loss_history()
             self.last_saved_step = current_step
-    
+
     def on_train_end(self):
-        """训练结束时保存最终版本"""
         self._save_loss_history()
-    
+
+    def _build_effective_history(self):
+        if not self.append_existing or not self._existing_history:
+            return self.model.losshistory
+        merged_payload = _merge_history_payloads(self._existing_history, self.model.losshistory)
+        return _history_payload_to_namespace(merged_payload)
+
     def _save_loss_history(self):
-        """保存loss历史图像（使用详细的损失历史图）"""
         try:
-            # 1. 保存汇总图：PDE Loss、BC Loss、总Loss
+            effective_history = self._build_effective_history()
             plot_and_save_loss_history(
-                self.model.losshistory, 
+                effective_history,
                 self.save_dir,
                 filename=self.filename,
                 num_pde_losses=self.num_pde_losses,
@@ -107,28 +184,21 @@ class LossHistoryCallback(dde.callbacks.Callback):
                 pde_label=self.pde_label,
                 bc_label=self.bc_label,
                 bc_loss_names=self.bc_loss_names,
-                data_loss_prefix="obs_"
+                data_loss_prefix=self.data_loss_prefix,
+                data_label=self.data_label,
+                show_total=self.show_total,
             )
-            
-            # 2. 保存损失历史数据为JSON
-            save_loss_history_json(self.model.losshistory, self.save_dir, filename="loss_history.json")
-            save_best_test_loss_json(self.model.losshistory, self.save_dir, filename="best_test_loss.json")
-            
-            # 3. 如果需要，保存每个损失分量的详细图
+            save_loss_history_json(effective_history, self.save_dir, filename="loss_history.json")
+            save_best_test_loss_json(effective_history, self.save_dir, filename="best_test_loss.json")
             if self.save_all_components:
                 plot_all_loss_components(
-                    self.model.losshistory,
+                    effective_history,
                     self.save_dir,
                     filename="所有损失项详细图.png",
                     num_pde_losses=self.num_pde_losses,
                     num_bc_losses=self.num_bc_losses,
                     pde_loss_names=self.pde_loss_names,
-                    bc_loss_names=self.bc_loss_names
+                    bc_loss_names=self.bc_loss_names,
                 )
-            # 静默保存，不打印信息，避免输出过多（函数内部会打印）
-        except Exception as e:
-            # 静默处理错误，避免中断训练
-            # 只在调试时打印错误信息
-            import sys
-            if hasattr(sys, '_getframe'):
-                pass  # 静默处理
+        except Exception:
+            pass

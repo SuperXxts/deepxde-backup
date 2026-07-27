@@ -52,6 +52,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obs-boundary-weight", type=float, default=20.0)
     parser.add_argument("--anchor-weight", type=float, default=1.0)
     parser.add_argument("--reaction-weight", type=float, default=5.0)
+    parser.add_argument("--material-smoothness-weight", type=float, default=1.0e-3)
+    parser.add_argument("--k-min-factor", type=float, default=0.35)
+    parser.add_argument("--k-max-factor", type=float, default=1.80)
+    parser.add_argument("--mu-min-factor", type=float, default=0.40)
+    parser.add_argument("--mu-max-factor", type=float, default=1.70)
     parser.add_argument("--gradient-diagnostic-period", type=int, default=0)
     parser.add_argument("--eval-checkpoint", choices=("best", "final"), default="best")
     parser.add_argument("--run-note", type=str, default="")
@@ -155,6 +160,24 @@ def main() -> None:
     true_A = float(fem_config.settlement)
     fixed_A = float(args.fixed_A) * true_A
     init_A = float(args.init_A) * true_A
+    reaction_scale = abs(float(fem_result.total_reaction_y)) + 1.0e-12
+    k_min = float(args.k_min_factor) * k0
+    k_max = float(args.k_max_factor) * k0
+    mu_min = float(args.mu_min_factor) * mu0
+    mu_max = float(args.mu_max_factor) * mu0
+
+    def normalize_inputs_torch(x):
+        x_center = torch.as_tensor(
+            [0.5 * fem_config.width, 0.5 * fem_config.depth],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        x_scale = torch.as_tensor(
+            [0.5 * fem_config.width, 0.5 * fem_config.depth],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        return (x - x_center) / x_scale
 
     def lambda_from_k_mu(k, mu):
         return k - 2.0 * mu / 3.0
@@ -167,13 +190,13 @@ def main() -> None:
         return sxx, syy, sxy
 
     def material_from_output(y):
-        zk = torch.clamp(y[:, 5:6], min=-3.0, max=3.0)
-        zmu = torch.clamp(y[:, 6:7], min=-3.0, max=3.0)
-        return k0 * torch.exp(zk), mu0 * torch.exp(zmu)
+        k = k_min + (k_max - k_min) * torch.sigmoid(y[:, 5:6])
+        mu = mu_min + (mu_max - mu_min) * torch.sigmoid(y[:, 6:7])
+        return k, mu
 
     def assemble_fields(raw: np.ndarray) -> np.ndarray:
-        pred_k = k0 * np.exp(np.clip(raw[:, 5:6], -3.0, 3.0))
-        pred_mu = mu0 * np.exp(np.clip(raw[:, 6:7], -3.0, 3.0))
+        pred_k = k_min + (k_max - k_min) / (1.0 + np.exp(-raw[:, 5:6]))
+        pred_mu = mu_min + (mu_max - mu_min) / (1.0 + np.exp(-raw[:, 6:7]))
         pred_e = 9.0 * pred_k * pred_mu / (3.0 * pred_k + pred_mu)
         pred_nu = (3.0 * pred_k - 2.0 * pred_mu) / (2.0 * (3.0 * pred_k + pred_mu))
         return np.column_stack([raw[:, 0:5], pred_k, pred_mu, pred_e, pred_nu])
@@ -226,6 +249,10 @@ def main() -> None:
         exy = 0.5 * (ux_y + uy_x)
         k_pred, mu_pred = material_from_output(y)
         sxx_c, syy_c, sxy_c = stress_from_k_mu(k_pred, mu_pred, exx, eyy, exy)
+        k_x = dde.grad.jacobian(k_pred, x, i=0, j=0) / k0
+        k_y = dde.grad.jacobian(k_pred, x, i=0, j=1) / k0
+        mu_x = dde.grad.jacobian(mu_pred, x, i=0, j=0) / mu0
+        mu_y = dde.grad.jacobian(mu_pred, x, i=0, j=1) / mu0
         sxx_x = dde.grad.jacobian(sxx_c, x, i=0, j=0)
         syy_y = dde.grad.jacobian(syy_c, x, i=0, j=1)
         sxy_x = dde.grad.jacobian(sxy_c, x, i=0, j=0)
@@ -236,6 +263,10 @@ def main() -> None:
             sxx_c - y[:, 2:3],
             syy_c - y[:, 3:4],
             sxy_c - y[:, 4:5],
+            k_x,
+            k_y,
+            mu_x,
+            mu_y,
         ]
 
     def boundary_bottom(x, on_boundary):
@@ -318,6 +349,10 @@ def main() -> None:
         "constitutive_sxx",
         "constitutive_syy",
         "constitutive_sxy",
+        "smooth_K_x",
+        "smooth_K_y",
+        "smooth_mu_x",
+        "smooth_mu_y",
         "bottom_ux",
         "bottom_uy",
         "left_ux",
@@ -388,11 +423,11 @@ def main() -> None:
             _, syy_c, _ = stress_from_k_mu(k_pred, mu_pred, ux_x, uy_y, 0.5 * (ux_y + uy_x))
             resultant = torch.sum(syy_c[row_index] * weights)
             result = torch.zeros((outputs.shape[0], 1), dtype=outputs.dtype, device=outputs.device)
-            result[row_index, 0:1] = resultant
+            result[row_index, 0:1] = resultant / reaction_scale
             return result
 
     if settings["reaction"]:
-        target_reaction = np.full((len(reaction_x), 1), true_reaction_y, dtype=np.float32)
+        target_reaction = np.full((len(reaction_x), 1), true_reaction_y / reaction_scale, dtype=np.float32)
         reaction_operator = ConstitutiveReactionIntegral(reaction_weights, boundary_y=fem_config.depth)
         bcs.append(dde.icbc.PointSetOperatorBC(reaction_x, target_reaction, reaction_operator))
         loss_terms.append("global_reaction_y")
@@ -412,7 +447,12 @@ def main() -> None:
         depth = args.wide_depth if settings["wide"] else args.depth
         layer_sizes = [2] + [[int(width)] * 7 for _ in range(int(depth))] + [7]
         net = dde.nn.PFNN(layer_sizes, "tanh", "Glorot normal")
-        network_config = {"type": "DeepXDE PFNN", "layer_sizes": layer_sizes}
+        net.apply_feature_transform(normalize_inputs_torch)
+        network_config = {
+            "type": "DeepXDE PFNN",
+            "layer_sizes": layer_sizes,
+            "input_normalization": "x,y mapped to [-1,1] before the neural network",
+        }
     else:
         init_beta = [init_A] + [0.0] * (max(1, int(args.boundary_modes)) - 1)
         net = BoundaryMaterialPFNN(
@@ -434,6 +474,7 @@ def main() -> None:
             plate_width=fem_config.plate_width,
             boundary_mode_scale=1.0,
         )
+        net.apply_feature_transform(normalize_inputs_torch)
         network_config = {
             "type": "BoundaryMaterialPFNN",
             "state_width": args.width,
@@ -443,6 +484,7 @@ def main() -> None:
             "num_boundary_modes": int(args.boundary_modes),
             "use_boundary_layer": bool(settings["boundary_layer"]),
             "boundary_mode_type": "plate",
+            "input_normalization": "state/material branches use normalized coordinates; boundary branch uses physical coordinates",
         }
 
     model = dde.Model(data, net)
@@ -450,6 +492,7 @@ def main() -> None:
     momentum_weight = float(args.physics_weight if args.momentum_weight is None else args.momentum_weight)
     constitutive_weight = float(args.physics_weight if args.constitutive_weight is None else args.constitutive_weight)
     loss_weights: list[float] = [momentum_weight] * 2 + [constitutive_weight] * 3
+    loss_weights.extend([float(args.material_smoothness_weight)] * 4)
     loss_weights.extend([float(args.boundary_weight)] * 10)
     if settings["decoupled_obs"]:
         loss_weights.extend(
@@ -493,6 +536,7 @@ def main() -> None:
         groups = {
             "momentum": [i for i, name in enumerate(loss_terms) if name.startswith("momentum_")],
             "constitutive": [i for i, name in enumerate(loss_terms) if name.startswith("constitutive_")],
+            "material_smoothness": [i for i, name in enumerate(loss_terms) if name.startswith("smooth_")],
             "essential_boundary": [
                 i
                 for i, name in enumerate(loss_terms)
@@ -682,7 +726,19 @@ def main() -> None:
             "torch_cuda_available": bool(torch.cuda.is_available()),
             "torch_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
             "network": network_config,
-            "material_parameterization": "dual: K=K_ref*exp(zK), mu=mu_ref*exp(zmu)",
+            "material_parameterization": "bounded dual sigmoid: K in [k_min_factor*K_ref, k_max_factor*K_ref], mu in [mu_min_factor*mu_ref, mu_max_factor*mu_ref]",
+            "material_bounds": {
+                "K_min": k_min,
+                "K_max": k_max,
+                "mu_min": mu_min,
+                "mu_max": mu_max,
+                "k_min_factor": float(args.k_min_factor),
+                "k_max_factor": float(args.k_max_factor),
+                "mu_min_factor": float(args.mu_min_factor),
+                "mu_max_factor": float(args.mu_max_factor),
+            },
+            "reaction_loss_form": "relative resultant reaction residual",
+            "reaction_scale": reaction_scale,
             "fem_config": fem_config.__dict__,
             "true_settlement": true_A,
             "fixed_settlement": fixed_A,

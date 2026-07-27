@@ -98,56 +98,55 @@ def save_best_test_loss_json(losshistory, save_dir, filename="best_test_loss.jso
     except Exception as e:
         print(f"Failed to save best test loss json: {e}")
 
-def plot_and_save_loss_history(losshistory, save_dir, filename="损失历史详细图.png", num_pde_losses=None, num_bc_losses=None, pde_label="PDE Loss", bc_label="BC Loss", bc_loss_names=None, data_loss_prefix="obs_"):
+def plot_and_save_loss_history(
+    losshistory,
+    save_dir,
+    filename="loss_history.png",
+    num_pde_losses=None,
+    num_bc_losses=None,
+    pde_label="Physics Loss",
+    bc_label="Boundary Loss",
+    bc_loss_names=None,
+    data_loss_prefix="obs_",
+    data_label="Observation Loss",
+    show_total=False,
+):
     """
-    绘制并保存损失历史图
+    ???????????
     """
     save_path = _get_save_path(save_dir, 'png', filename)
     loss_train = np.array(losshistory.loss_train)
     steps = losshistory.steps
-    
+
     loss_train_sum = np.sum(loss_train, axis=1)
     loss_test_sum = np.sum(losshistory.loss_test, axis=1) if losshistory.loss_test else []
-    
+
     plt.figure(figsize=(10, 6))
-    plt.plot(steps, loss_train_sum, label='Train loss', color='k')
-    if len(loss_test_sum) > 0:
-        plt.plot(steps, loss_test_sum, label='Test loss', color='r')
-    
-    # 如果提供了PDE/BC分割信息，且BC损失数量大于0，则绘制分类汇总损失
-    # 如果num_bc_losses为0（硬边界情况），则不绘制PDE/BC分解，因为Train Loss = PDE Loss
+    if show_total:
+        plt.plot(steps, loss_train_sum, label='Train loss', color='k')
+        if len(loss_test_sum) > 0:
+            plt.plot(steps, loss_test_sum, label='Test loss', color='r')
+
     if num_pde_losses is not None and num_bc_losses is not None and num_bc_losses > 0:
         loss_pde = np.sum(loss_train[:, :num_pde_losses], axis=1)
-        
-        # 格式化PDE标签
-        if "$" not in pde_label and "_" in pde_label:
-            parts = pde_label.split('_', 1)
-            pde_label = f"${parts[0]}_{{{parts[1]}}}$"
-            
         plt.plot(steps, loss_pde, label=pde_label, linestyle='--')
-        
+
         if bc_loss_names:
             data_indices = [i for i, name in enumerate(bc_loss_names) if isinstance(name, str) and name.startswith(data_loss_prefix)]
             bc_indices = [i for i in range(num_bc_losses) if i not in data_indices]
             if bc_indices:
                 loss_bc = np.sum(loss_train[:, num_pde_losses + np.array(bc_indices)], axis=1)
-                if "$" not in bc_label and "_" in bc_label:
-                    parts = bc_label.split('_', 1)
-                    bc_label = f"${parts[0]}_{{{parts[1]}}}$"
                 plt.plot(steps, loss_bc, label=bc_label, linestyle=':')
             if data_indices:
                 loss_data = np.sum(loss_train[:, num_pde_losses + np.array(data_indices)], axis=1)
-                plt.plot(steps, loss_data, label='Data Loss', linestyle='-.')
+                plt.plot(steps, loss_data, label=data_label, linestyle='-.')
         else:
-            loss_bc = np.sum(loss_train[:, num_pde_losses:num_pde_losses+num_bc_losses], axis=1)
-            if "$" not in bc_label and "_" in bc_label:
-                parts = bc_label.split('_', 1)
-                bc_label = f"${parts[0]}_{{{parts[1]}}}$"
+            loss_bc = np.sum(loss_train[:, num_pde_losses:num_pde_losses + num_bc_losses], axis=1)
             plt.plot(steps, loss_bc, label=bc_label, linestyle=':')
     elif num_pde_losses is not None and (num_bc_losses is None or num_bc_losses == 0):
-        # 仅当BC损失存在时才绘制分解。如果全是PDE损失，Train Loss已经包含了它。
-        pass
-    
+        loss_pde = np.sum(loss_train[:, :num_pde_losses], axis=1)
+        plt.plot(steps, loss_pde, label=pde_label, linestyle='--')
+
     plt.xlabel('Steps')
     plt.ylabel('Loss')
     plt.title('Loss History')
@@ -217,199 +216,6 @@ def plot_all_loss_components(losshistory, save_dir, filename="所有损失项详
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     plt.close()
-
-
-def _extract_true_region_constants(case_config, num_regions):
-    if case_config is None or num_regions <= 0:
-        return [], [], []
-
-    lambda_truths = [float(case_config.lambda_bg)]
-    mu_truths = [float(case_config.mu_bg)]
-
-    if num_regions >= 2:
-        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_1))
-        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_1))
-    if num_regions >= 3:
-        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_2))
-        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_2))
-
-    lambda_truths = lambda_truths[:num_regions]
-    mu_truths = mu_truths[:num_regions]
-    bulk_truths = [float(lmbd + (2.0 / 3.0) * mu) for lmbd, mu in zip(lambda_truths, mu_truths)]
-    return lambda_truths, mu_truths, bulk_truths
-
-
-def _append_region_history(records, history_rows, step_offset=0, running_step=None):
-    current_step = int(running_step if running_step is not None else step_offset)
-    for row in history_rows:
-        lambda_regions = row.get("lambda_regions")
-        mu_regions = row.get("mu_regions")
-        bulk_regions = row.get("bulk_regions")
-        if not isinstance(lambda_regions, list) or not isinstance(mu_regions, list):
-            continue
-        if len(lambda_regions) == 0 or len(lambda_regions) != len(mu_regions):
-            continue
-
-        if row.get("global_step") is not None:
-            step = int(row["global_step"])
-            current_step = step
-        elif row.get("step") is not None:
-            step = int(step_offset) + int(row["step"])
-            current_step = step
-        elif row.get("chunk_iterations") is not None:
-            current_step += int(row["chunk_iterations"])
-            step = current_step
-        else:
-            continue
-
-        payload = {
-            "step": step,
-            "lambda_regions": [float(value) for value in lambda_regions],
-            "mu_regions": [float(value) for value in mu_regions],
-        }
-        if isinstance(bulk_regions, list) and len(bulk_regions) == len(mu_regions):
-            payload["bulk_regions"] = [float(value) for value in bulk_regions]
-        records.append(payload)
-    return current_step
-
-
-def plot_region_parameter_evolution(
-    save_dir,
-    case_config,
-    total_iterations=None,
-    final_region_payload=None,
-    filename="region_parameter_evolution.png",
-    json_filename="region_parameter_evolution.json",
-):
-    plan_path = _get_save_path(save_dir, "json", "stage_training_plan.json")
-    geometry_path = _get_save_path(save_dir, "json", "geometry_stage_history.json")
-    material_path = _get_save_path(save_dir, "json", "material_stage_history.json")
-    adaptive_main_path = _get_save_path(save_dir, "json", "adaptive_main_stage_history.json")
-    main_schedule_path = _get_save_path(save_dir, "json", "main_stage_schedule.json")
-    output_json_path = _get_save_path(save_dir, "json", json_filename)
-    output_png_path = _get_save_path(save_dir, "png", filename)
-
-    plan = {}
-    if os.path.isfile(plan_path):
-        with open(plan_path, "r", encoding="utf-8") as handle:
-            plan = json.load(handle)
-
-    warmup_iterations = int(plan.get("warmup_iterations", 0))
-    geometry_iterations = int(plan.get("geometry_stage_iterations", 0))
-    material_iterations = int(plan.get("material_stage_iterations", 0))
-    refinement_iterations = int(plan.get("refinement_stage_iterations", 0))
-    if total_iterations is None:
-        total_iterations = int(
-            warmup_iterations
-            + geometry_iterations
-            + material_iterations
-            + int(plan.get("main_iterations", 0))
-            + refinement_iterations
-        )
-
-    records = []
-
-    if os.path.isfile(geometry_path):
-        with open(geometry_path, "r", encoding="utf-8") as handle:
-            geometry_payload = json.load(handle)
-        _append_region_history(records, geometry_payload.get("history", []), step_offset=warmup_iterations)
-
-    material_offset = warmup_iterations + geometry_iterations
-    if os.path.isfile(material_path):
-        with open(material_path, "r", encoding="utf-8") as handle:
-            material_payload = json.load(handle)
-        _append_region_history(records, material_payload.get("history", []), step_offset=material_offset)
-
-    main_offset = warmup_iterations + geometry_iterations + material_iterations
-    if os.path.isfile(adaptive_main_path):
-        with open(adaptive_main_path, "r", encoding="utf-8") as handle:
-            adaptive_payload = json.load(handle)
-        _append_region_history(records, adaptive_payload.get("chunks", []), step_offset=main_offset, running_step=main_offset)
-    elif os.path.isfile(main_schedule_path):
-        with open(main_schedule_path, "r", encoding="utf-8") as handle:
-            main_payload = json.load(handle)
-        _append_region_history(records, main_payload.get("history", []), step_offset=main_offset, running_step=main_offset)
-
-    if final_region_payload is not None:
-        lambda_regions = final_region_payload.get("lambda_regions")
-        mu_regions = final_region_payload.get("mu_regions")
-        if isinstance(lambda_regions, list) and isinstance(mu_regions, list) and len(lambda_regions) == len(mu_regions):
-            payload = {
-                "step": int(total_iterations),
-                "lambda_regions": [float(value) for value in lambda_regions],
-                "mu_regions": [float(value) for value in mu_regions],
-            }
-            bulk_regions = final_region_payload.get("bulk_regions")
-            if isinstance(bulk_regions, list) and len(bulk_regions) == len(mu_regions):
-                payload["bulk_regions"] = [float(value) for value in bulk_regions]
-            records.append(payload)
-
-    if not records:
-        return None
-
-    unique_records = {}
-    for row in records:
-        unique_records[int(row["step"])] = row
-    records = [unique_records[key] for key in sorted(unique_records)]
-
-    num_regions = len(records[-1]["mu_regions"])
-    lambda_truths, mu_truths, bulk_truths = _extract_true_region_constants(case_config, num_regions)
-    steps = [int(row["step"]) for row in records]
-    lambda_matrix = np.asarray([row["lambda_regions"] for row in records], dtype=float)
-    mu_matrix = np.asarray([row["mu_regions"] for row in records], dtype=float)
-    has_bulk = all("bulk_regions" in row for row in records)
-    bulk_matrix = np.asarray([row["bulk_regions"] for row in records], dtype=float) if has_bulk else None
-    parameterization = str(final_region_payload.get("parameterization", "bulkmu" if has_bulk else "lamemu")) if final_region_payload else ("bulkmu" if has_bulk else "lamemu")
-
-    payload = {
-        "steps": steps,
-        "parameterization": parameterization,
-        "lambda_regions": lambda_matrix.tolist(),
-        "mu_regions": mu_matrix.tolist(),
-        "lambda_truths": lambda_truths,
-        "mu_truths": mu_truths,
-    }
-    if has_bulk:
-        payload["bulk_regions"] = bulk_matrix.tolist()
-        payload["bulk_truths"] = bulk_truths
-    with open(output_json_path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, ensure_ascii=False)
-
-    if has_bulk:
-        matrices = [bulk_matrix, mu_matrix]
-        truths = [bulk_truths, mu_truths]
-        field_names = ["Bulk", "Mu"]
-    else:
-        matrices = [lambda_matrix, mu_matrix]
-        truths = [lambda_truths, mu_truths]
-        field_names = ["Lambda", "Mu"]
-
-    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4", "#ff7f0e", "#2ca02c"])
-
-    for axis, matrix, truth_values, field_name in zip(axes, matrices, truths, field_names):
-        for index in range(matrix.shape[1]):
-            color = colors[index % len(colors)]
-            axis.plot(steps, matrix[:, index], color=color, linewidth=2.0, label=f"pred_r{index}")
-            if index < len(truth_values):
-                axis.axhline(truth_values[index], color=color, linestyle="--", linewidth=1.6, alpha=0.85, label=f"true_r{index}")
-        axis.set_title(f"{field_name} Regions vs Step")
-        axis.set_xlabel("Step")
-        axis.set_ylabel(field_name)
-        axis.grid(True, alpha=0.25)
-        axis.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.18),
-            ncol=2,
-            fontsize=8,
-            frameon=False,
-        )
-
-    plt.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
-    plt.savefig(output_png_path, dpi=300)
-    plt.close(fig)
-    return payload
-
 
 def save_model_checkpoint(model, save_dir, filename="model.ckpt"):
     """
@@ -731,6 +537,174 @@ def plot_displacement_vector_field(x, ux, uy, save_dir, filename="位移矢量�
     plt.savefig(save_path, dpi=300)
     plt.close()
     print(f"Displacement vector field plot saved to {save_path}")
+
+def _append_region_history(records, history_rows, step_offset=0, running_step=None):
+    current_step = int(running_step if running_step is not None else step_offset)
+    for row in history_rows:
+        lambda_regions = row.get("lambda_regions")
+        mu_regions = row.get("mu_regions")
+        if not isinstance(lambda_regions, list) or not isinstance(mu_regions, list):
+            continue
+        if len(lambda_regions) == 0 or len(lambda_regions) != len(mu_regions):
+            continue
+
+        if row.get("global_step") is not None:
+            step = int(row["global_step"])
+            current_step = step
+        elif row.get("step") is not None:
+            step = int(step_offset) + int(row["step"])
+            current_step = step
+        elif row.get("chunk_iterations") is not None:
+            current_step += int(row["chunk_iterations"])
+            step = current_step
+        else:
+            continue
+
+        records.append(
+            {
+                "step": step,
+                "lambda_regions": [float(value) for value in lambda_regions],
+                "mu_regions": [float(value) for value in mu_regions],
+            }
+        )
+    return current_step
+
+
+def _extract_true_region_constants(case_config, num_regions):
+    if case_config is None or num_regions <= 0:
+        return [], []
+
+    lambda_truths = [float(case_config.lambda_bg)]
+    mu_truths = [float(case_config.mu_bg)]
+
+    if num_regions >= 2:
+        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_1))
+        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_1))
+    if num_regions >= 3:
+        lambda_truths.append(float(case_config.lambda_bg + case_config.lambda_ctr_2))
+        mu_truths.append(float(case_config.mu_bg + case_config.mu_ctr_2))
+
+    return lambda_truths[:num_regions], mu_truths[:num_regions]
+
+
+def plot_region_parameter_evolution(
+    save_dir,
+    case_config,
+    total_iterations=None,
+    final_region_payload=None,
+    filename="region_parameter_evolution.png",
+    json_filename="region_parameter_evolution.json",
+):
+    plan_path = _get_save_path(save_dir, "json", "stage_training_plan.json")
+    geometry_path = _get_save_path(save_dir, "json", "geometry_stage_history.json")
+    material_path = _get_save_path(save_dir, "json", "material_stage_history.json")
+    adaptive_main_path = _get_save_path(save_dir, "json", "adaptive_main_stage_history.json")
+    main_schedule_path = _get_save_path(save_dir, "json", "main_stage_schedule.json")
+    output_json_path = _get_save_path(save_dir, "json", json_filename)
+    output_png_path = _get_save_path(save_dir, "png", filename)
+
+    plan = {}
+    if os.path.isfile(plan_path):
+        with open(plan_path, "r", encoding="utf-8") as handle:
+            plan = json.load(handle)
+
+    warmup_iterations = int(plan.get("warmup_iterations", 0))
+    geometry_iterations = int(plan.get("geometry_stage_iterations", 0))
+    material_iterations = int(plan.get("material_stage_iterations", 0))
+    refinement_iterations = int(plan.get("refinement_stage_iterations", 0))
+    if total_iterations is None:
+        total_iterations = int(
+            warmup_iterations
+            + geometry_iterations
+            + material_iterations
+            + int(plan.get("main_iterations", 0))
+            + refinement_iterations
+        )
+
+    records = []
+
+    if os.path.isfile(geometry_path):
+        with open(geometry_path, "r", encoding="utf-8") as handle:
+            geometry_payload = json.load(handle)
+        _append_region_history(records, geometry_payload.get("history", []), step_offset=warmup_iterations)
+
+    material_offset = warmup_iterations + geometry_iterations
+    if os.path.isfile(material_path):
+        with open(material_path, "r", encoding="utf-8") as handle:
+            material_payload = json.load(handle)
+        _append_region_history(records, material_payload.get("history", []), step_offset=material_offset)
+
+    main_offset = warmup_iterations + geometry_iterations + material_iterations
+    if os.path.isfile(adaptive_main_path):
+        with open(adaptive_main_path, "r", encoding="utf-8") as handle:
+            adaptive_payload = json.load(handle)
+        _append_region_history(records, adaptive_payload.get("chunks", []), step_offset=main_offset, running_step=main_offset)
+    elif os.path.isfile(main_schedule_path):
+        with open(main_schedule_path, "r", encoding="utf-8") as handle:
+            main_payload = json.load(handle)
+        _append_region_history(records, main_payload.get("history", []), step_offset=main_offset, running_step=main_offset)
+
+    if final_region_payload is not None:
+        lambda_regions = final_region_payload.get("lambda_regions")
+        mu_regions = final_region_payload.get("mu_regions")
+        if isinstance(lambda_regions, list) and isinstance(mu_regions, list) and len(lambda_regions) == len(mu_regions):
+            records.append(
+                {
+                    "step": int(total_iterations),
+                    "lambda_regions": [float(value) for value in lambda_regions],
+                    "mu_regions": [float(value) for value in mu_regions],
+                }
+            )
+
+    if not records:
+        return None
+
+    unique_records = {}
+    for row in records:
+        unique_records[int(row["step"])] = row
+    records = [unique_records[key] for key in sorted(unique_records)]
+
+    num_regions = len(records[-1]["lambda_regions"])
+    lambda_truths, mu_truths = _extract_true_region_constants(case_config, num_regions)
+    steps = [int(row["step"]) for row in records]
+    lambda_matrix = np.asarray([row["lambda_regions"] for row in records], dtype=float)
+    mu_matrix = np.asarray([row["mu_regions"] for row in records], dtype=float)
+
+    payload = {
+        "steps": steps,
+        "lambda_regions": lambda_matrix.tolist(),
+        "mu_regions": mu_matrix.tolist(),
+        "lambda_truths": lambda_truths,
+        "mu_truths": mu_truths,
+    }
+    with open(output_json_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.8))
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["#1f77b4", "#ff7f0e", "#2ca02c"])
+
+    for axis, matrix, truths, field_name in zip(
+        axes,
+        [lambda_matrix, mu_matrix],
+        [lambda_truths, mu_truths],
+        ["Lambda", "Mu"],
+    ):
+        for index in range(matrix.shape[1]):
+            color = colors[index % len(colors)]
+            axis.plot(steps, matrix[:, index], color=color, linewidth=2.0, label=f"pred_r{index}")
+            if index < len(truths):
+                axis.axhline(truths[index], color=color, linestyle="--", linewidth=1.6, alpha=0.85, label=f"true_r{index}")
+        axis.set_title(f"{field_name} Regions vs Step")
+        axis.set_xlabel("Step")
+        axis.set_ylabel(field_name)
+        axis.grid(True, alpha=0.25)
+        axis.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, fontsize=8, frameon=False)
+
+    plt.tight_layout(rect=(0.0, 0.08, 1.0, 1.0))
+    plt.savefig(output_png_path, dpi=300)
+    plt.close(fig)
+    return payload
+
 
 def plot_parameter_history(param_data_or_file, true_values, param_names, save_path):
     """

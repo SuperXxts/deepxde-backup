@@ -17,6 +17,38 @@ def make_grid(n: int, include_boundary: bool = True) -> np.ndarray:
     return np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
 
 
+def structured_grid_points(nx: int, ny: int, include_boundary: bool = True) -> np.ndarray:
+    """Return a structured nx by ny grid on the unit square."""
+    nx = int(nx)
+    ny = int(ny)
+    if nx <= 1 or ny <= 1:
+        raise ValueError("nx and ny must be larger than 1.")
+    if include_boundary:
+        xs = np.linspace(0.0, 1.0, nx)
+        ys = np.linspace(0.0, 1.0, ny)
+    else:
+        xs = np.linspace(0.0, 1.0, nx + 2)[1:-1]
+        ys = np.linspace(0.0, 1.0, ny + 2)[1:-1]
+    xx, yy = np.meshgrid(xs, ys, indexing="xy")
+    return np.column_stack([xx.ravel(), yy.ravel()]).astype(np.float32)
+
+
+def make_observation_points(count: int, seed: int) -> np.ndarray:
+    """Interior displacement observation points with FEM-consistent margins."""
+    rng = np.random.default_rng(int(seed))
+    x = rng.uniform(0.08, 0.92, int(count))
+    y = rng.uniform(0.08, 0.90, int(count))
+    return np.column_stack([x, y]).astype(np.float32)
+
+
+def make_validation_points(count: int, seed: int) -> np.ndarray:
+    """Independent validation points distributed over the full interior."""
+    rng = np.random.default_rng(int(seed) + 7919)
+    x = rng.uniform(0.02, 0.98, int(count))
+    y = rng.uniform(0.02, 0.98, int(count))
+    return np.column_stack([x, y]).astype(np.float32)
+
+
 def material_E(x: np.ndarray) -> np.ndarray:
     """Synthetic heterogeneous Young's modulus field."""
     xp = x[:, 0:1]
