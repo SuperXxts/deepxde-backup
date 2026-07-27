@@ -4418,7 +4418,13 @@ def save_run_config_artifacts(args, save_dir, case_config, net=None, metadata=No
     return config_payload
 
 
-def get_material_branch_parameters(net):
+def get_adaptive_balance_parameters(net, parameter_scope="material_branch"):
+    scope = str(parameter_scope).strip().lower()
+    if scope == "all_network":
+        params = [parameter for parameter in net.parameters() if parameter.requires_grad]
+        return params, "all_network"
+    if scope != "material_branch":
+        raise ValueError(f"Unsupported adaptive-balance parameter scope: {parameter_scope}")
     if hasattr(net, "material_net"):
         params = [parameter for parameter in net.material_net.parameters() if parameter.requires_grad]
         if params:
@@ -4429,6 +4435,11 @@ def get_material_branch_parameters(net):
             return [parameter], "raw_material_params"
     params = [parameter for parameter in net.parameters() if parameter.requires_grad]
     return params, "full_network_fallback"
+
+
+def get_material_branch_parameters(net):
+    """Backward-compatible material-branch-only parameter selection."""
+    return get_adaptive_balance_parameters(net, parameter_scope="material_branch")
 
 
 def build_loss_group_indices(args):
@@ -4533,7 +4544,10 @@ class MaterialBranchGradNormCallback(dde.callbacks.Callback):
         if step <= 0 or step % self.period != 0:
             return
 
-        parameters, parameter_source = get_material_branch_parameters(self.model.net)
+        parameters, parameter_source = get_adaptive_balance_parameters(
+            self.model.net,
+            parameter_scope=getattr(self.args, "dynamic_balance_parameter_scope", "material_branch"),
+        )
         self.parameter_source = parameter_source
         if not parameters:
             return
@@ -4582,6 +4596,9 @@ class MaterialBranchGradNormCallback(dde.callbacks.Callback):
 
         row = {
             "step": int(step),
+            "parameter_scope": str(
+                getattr(self.args, "dynamic_balance_parameter_scope", "material_branch")
+            ),
             "parameter_source": self.parameter_source,
             "physics_loss": float(physics_loss.detach().cpu().item()),
             "observation_loss": float(observation_loss.detach().cpu().item()),
@@ -4594,10 +4611,10 @@ class MaterialBranchGradNormCallback(dde.callbacks.Callback):
             "boundary_scale": float(self.current_scales[2]),
         }
         self.history.append(row)
-        save_json(os.path.join(self.save_dir, "json", "材料分支梯度归一化历史.json"), self.history)
+        save_json(os.path.join(self.save_dir, "json", "动态损失权重历史.json"), self.history)
 
     def on_train_end(self):
-        save_json(os.path.join(self.save_dir, "json", "材料分支梯度归一化历史.json"), self.history)
+        save_json(os.path.join(self.save_dir, "json", "动态损失权重历史.json"), self.history)
 
     def _apply_loss_weights(self):
         self.model.loss_weights = resolve_loss_weights(
@@ -4845,6 +4862,11 @@ def build_common_parser(description):
         choices=["none", "material_gradnorm"],
     )
     parser.add_argument("--dynamic_balance_period", type=int, default=1000)
+    parser.add_argument(
+        "--dynamic_balance_parameter_scope",
+        choices=["material_branch", "all_network"],
+        default="material_branch",
+    )
     parser.add_argument("--dynamic_balance_ema", type=float, default=0.5)
     parser.add_argument("--dynamic_balance_reg_scale", type=float, default=1.0)
     parser.add_argument("--dynamic_balance_min_physics_scale", type=float, default=0.25)
