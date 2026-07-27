@@ -92,6 +92,7 @@ python -u train_material_field.py \
   --exp_root "$REPO/exp/09.COMGERevisionSmoke" \
   --experiment_group "${EXPERIMENT_GROUP:-GradientScope}" \
   --run_name "$RUN_NAME" \
+  --save_dir "$SAVE_DIR" \
   --eval_nx 81 \
   --eval_ny 81 \
   --run_eval_after_train \
